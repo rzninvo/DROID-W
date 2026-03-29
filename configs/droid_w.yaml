@@ -6,7 +6,7 @@ setup_seed: 43
 fast_mode: True
 device: "cuda:0"
 save_gt_poses: True
-droidvis: False
+droidvis: True
 debug: False
 
 traj_filler:

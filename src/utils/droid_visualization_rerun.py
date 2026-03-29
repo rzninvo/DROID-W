@@ -10,8 +10,9 @@ import shutil
 import subprocess
 
 # --- headless safety (no Qt/GUI on cluster) ---
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.pop("DISPLAY", None)
+# Only set offscreen Qt if no display is available
+if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ---- helpers to draw a camera frustum as 3D line segments ----
 _CAM_POINTS = np.array([
@@ -41,21 +42,22 @@ def _to_rr_transform(mat4):
         return rr.Transform3D(mat4)          # older positional form
 
 def _rr_init(app_id: str):
-    # Be compatible across rerun-sdk versions
+    # rerun 0.30+: rr.init() takes application_id
+    for kwargs in [
+        dict(application_id=app_id),
+        dict(app_id=app_id),
+        dict(),
+    ]:
+        try:
+            rr.init(**kwargs)
+            return
+        except TypeError:
+            continue
+    # positional fallback
     try:
-        rr.init(app_id)  # older positional
-        return
-    except TypeError:
-        pass
-    try:
-        rr.init(application_id=app_id)  # some versions use 'application_id'
-        return
-    except TypeError:
-        pass
-    try:
-        rr.init(app_id=app_id)  # newer keyword
-    except TypeError:
-        rr.init()  # last resort: no app id
+        rr.init(app_id)
+    except Exception:
+        rr.init()
 
 def droid_visualization_rerun(
     video,
@@ -77,22 +79,25 @@ def droid_visualization_rerun(
     torch.cuda.set_device(device)
     _rr_init(app_id)
 
-    # Start a local web server on the node (no GUI/X11 required)
-    started_server = False
+    # Try native viewer first, fall back to web viewer, then file-only
+    started = False
     try:
-        rr.serve_web(port=web_port, open_browser=False)
-        started_server = True
-        print(f"[Rerun] Web server on http://127.0.0.1:{web_port}")
-    except TypeError:
-        # Older versions: fall back to serve() without args (binds a default port)
+        rr.spawn()
+        started = True
+        print("[Rerun] Native viewer spawned and connected")
+    except Exception:
+        pass
+    if not started:
         try:
-            rr.serve()
-            started_server = True
-            print("[Rerun] Started legacy rr.serve() (port is chosen by Rerun; check logs).")
-        except Exception as e:
-            print(f"[Rerun] Could not start web server: {e}")
+            rr.serve_web_viewer(web_port=web_port, open_browser=True)
+            started = True
+            print(f"[Rerun] Web viewer on http://127.0.0.1:{web_port}")
+        except Exception:
+            pass
+    if not started and not record_path:
+        print("[Rerun] No viewer available and no record path set")
 
-    # Optional: record to file for later playback
+    # Always save to file if record_path is set (in addition to live viewer)
     if record_path:
         try:
             rr.save(record_path)
@@ -102,7 +107,7 @@ def droid_visualization_rerun(
 
     # Global scene axes (best-effort across versions)
     try:
-        rr.log("world", rr.ViewCoordinates.RDF, timeless=True)  # OpenCV-ish axes
+        rr.log("world", rr.ViewCoordinates.RDF, static=True)  # OpenCV-ish axes
     except Exception:
         pass
 
