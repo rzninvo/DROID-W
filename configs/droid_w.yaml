@@ -161,7 +161,7 @@ mono_prior:
   save_depth: False
   feature_extractor: 'dinov2_reg_small_fine'
   save_feature: False
-  fastsam_model: './pretrained/fastsam/FastSAM-s.pt'   # or 'FastSAM-x.pt' for accuracy
+  fastsam_model: 'yolov8s-seg.pt' 
   save_fastsam_mask: False
 
 data:
