@@ -130,6 +130,10 @@ tracking:
     gba_weight_decay: 0.002
     enable_affine_transform: True
     enable_bidirectional_uncer: False
+    use_fastsam: True
+    fastsam_dynamic_classes: [0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19]
+    fastsam_max_uncertainty: 1.5    # uncertainty value assigned to detected dynamic pixels
+    fastsam_confidence_thresh: 0.5  # FastSAM detection confidence threshold
     
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
@@ -153,8 +157,10 @@ cam:
 mono_prior:
   depth: 'metric3d_vit_large'
   save_depth: False
-  feature_extractor: 'dinov2_reg_small_fine' 
+  feature_extractor: 'dinov2_reg_small_fine'
   save_feature: False
+  fastsam_model: './pretrained/fastsam/FastSAM-s.pt'   # or 'FastSAM-x.pt' for accuracy
+  save_fastsam_mask: False
 
 data:
   output: ./output/wildgs_slam

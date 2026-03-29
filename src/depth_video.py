@@ -100,9 +100,18 @@ class DepthVideo:
             self.affine_weights = self.affine_weights.squeeze(0).share_memory_()
             self.enable_affine_transform = cfg['tracking']['uncertainty_params']['enable_affine_transform']
             self.temp_y_cdot = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+
         else:
             self.dino_feats = None
             self.dino_feats_resize = None
+
+        # FastSAM semantic segmentation masks for dynamic objects
+        self.use_fastsam = cfg['tracking']['uncertainty_params'].get('use_fastsam', False)
+        if self.use_fastsam:
+            self.fastsam_masks = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale,
+                                              device=self.device, dtype=torch.float).share_memory_()
+        else:
+            self.fastsam_masks = None
 
     def get_lock(self):
         return self.counter.get_lock()
@@ -172,6 +181,15 @@ class DepthVideo:
             dino_feats_normalized = F.normalize(self.dino_feats_resize[index], p=2, dim=-3)
             dino_feats_tmp = dino_feats_normalized  # [1, C, H, W]
             C, H, W = dino_feats_tmp.shape[-3:]
+
+        # Store FastSAM mask and fuse with DINO uncertainty
+        if len(item) > 10 and item[10] is not None and self.fastsam_masks is not None:
+            self.fastsam_masks[index] = item[10]
+            # Fuse: max(dino_uncertainty, fastsam_uncertainty)
+            if self.uncertainty_aware:
+                fastsam_max = self.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
+                fastsam_uncer = self.fastsam_masks[index] * fastsam_max
+                self.uncertainties[index] = torch.max(self.uncertainties[index], fastsam_uncer)
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -376,6 +394,13 @@ class DepthVideo:
                     self.debug)          # t0, t1: window of keyframes for BA
             
             self.disps.clamp_(min=1e-5)
+
+            # Re-apply FastSAM masks after BA (CUDA kernels overwrite uncertainties from affine weights only)
+            if self.use_fastsam and self.fastsam_masks is not None and enable_update_uncer:
+                fastsam_max = self.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
+                for idx in range(t0, t1):
+                    fastsam_uncer = self.fastsam_masks[idx] * fastsam_max
+                    self.uncertainties[idx] = torch.max(self.uncertainties[idx], fastsam_uncer)
 
     @torch.no_grad()
     def visualize_uncertainty(self, target, weight, ii, jj, frame_choice="nearest", mode="Before"):

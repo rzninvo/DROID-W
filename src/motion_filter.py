@@ -6,6 +6,7 @@ from src.modules.droid_net import CorrBlock
 from src.utils.mono_priors.metric_depth_estimators import get_metric_depth_estimator, predict_metric_depth
 from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
+from src.utils.mono_priors.fastsam_segmentor import get_fastsam_model, predict_fastsam_mask
 
 class MotionFilter:
     """ This class is used to filter incoming frames and extract features 
@@ -35,6 +36,10 @@ class MotionFilter:
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
+
+        self.use_fastsam = cfg['tracking']['uncertainty_params'].get('use_fastsam', False)
+        if self.use_fastsam:
+            self.fastsam_model = get_fastsam_model(cfg)
 
     @torch.amp.autocast('cuda',enabled=True)
     def __context_encoder(self, image):
@@ -77,7 +82,9 @@ class MotionFilter:
                 if self.cfg['mapping']["uncertainty_params"]['activate']:
                     # If mapping needs dino features, we predict here and store the value in local disk
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
-            self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
+            fastsam_mask = predict_fastsam_mask(self.fastsam_model, tstamp, image, self.cfg, self.device,
+                                                save_mask=self.cfg['mono_prior'].get('save_fastsam_mask', False)) if self.use_fastsam else None
+            self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features, fastsam_mask)
         ### only add new frame if there is enough motion ###
         else:                
             # index correlation volume
@@ -106,8 +113,10 @@ class MotionFilter:
                     if self.cfg['mapping']["uncertainty_params"]['activate']:
                         # if mapping needs dino features, we predict here and store the value in local disk
                         _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
+                fastsam_mask = predict_fastsam_mask(self.fastsam_model, tstamp, image, self.cfg, self.device,
+                                                    save_mask=self.cfg['mono_prior'].get('save_fastsam_mask', False)) if self.use_fastsam else None
                 # add new frame to video, all params
-                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)     # video.counter += 1
+                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features, fastsam_mask)     # video.counter += 1
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
             else:
                 self.count += 1

@@ -120,6 +120,12 @@ class Frontend:
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
 
+        # Fuse FastSAM mask into propagated uncertainty
+        if self.video.use_fastsam and self.video.fastsam_masks is not None:
+            fastsam_max = self.video.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
+            fastsam_uncer = self.video.fastsam_masks[self.t1] * fastsam_max
+            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], fastsam_uncer)
+
         # update visualization
         self.video.set_dirty(self.graph.ii.min(), self.t1)
         torch.cuda.empty_cache()
@@ -151,13 +157,19 @@ class Frontend:
         # self.video.normalize()
         self.video.poses[self.t1] = self.video.poses[self.t1-1].clone()
         self.video.disps[self.t1] = self.video.disps[self.t1-4:self.t1].mean()
-        
+
         if self.video.enable_affine_transform:
             y_cdot = self.video.dino_feats_resize[self.t1].permute(1,2,0) @ self.video.affine_weights[:-1] + self.video.affine_weights[-1]
             self.video.temp_y_cdot[self.t1] = y_cdot
             self.video.uncertainties[self.t1] = torch.log(1.1 + torch.exp(y_cdot))
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
+
+        # Fuse FastSAM mask into propagated uncertainty
+        if self.video.use_fastsam and self.video.fastsam_masks is not None:
+            fastsam_max = self.video.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
+            fastsam_uncer = self.video.fastsam_masks[self.t1] * fastsam_max
+            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], fastsam_uncer)
 
         # initialization complete
         self.is_initialized = True
