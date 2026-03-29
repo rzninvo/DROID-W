@@ -28,28 +28,29 @@ DEFAULT_DYNAMIC_CLASSES = [
 _prev_mask = None
 
 
-def get_fastsam_model(cfg: Dict):
+def get_seg_model(cfg: Dict):
     """
-    Load FastSAM model based on configuration.
+    Load segmentation model based on configuration.
+    Supports any ultralytics model (YOLOv8-seg, FastSAM, etc.)
 
     Args:
         cfg: Configuration dictionary.
 
     Returns:
-        Loaded YOLO/FastSAM model.
+        Loaded YOLO model.
     """
     from ultralytics import YOLO
 
     device = cfg["device"]
-    model_name = cfg["mono_prior"].get("fastsam_model", "FastSAM-s.pt")
+    model_name = cfg["mono_prior"].get("seg_model", "yolov8s-seg.pt")
     model = YOLO(model_name)
     model.to(device)
     return model
 
 
 @torch.no_grad()
-@timer.section("FastSAM Segmentation")
-def predict_fastsam_mask(
+@timer.section("Segmentation")
+def predict_seg_mask(
     model,
     idx: int,
     input_tensor: torch.Tensor,
@@ -58,10 +59,10 @@ def predict_fastsam_mask(
     save_mask: bool = False,
 ) -> torch.Tensor:
     """
-    Run FastSAM segmentation and produce a binary dynamic-object mask.
+    Run segmentation and produce a binary dynamic-object mask.
 
     Args:
-        model: The YOLO/FastSAM model.
+        model: The YOLO segmentation model.
         idx: Frame index.
         input_tensor: Input image tensor of shape (3, H, W) in [0, 1] range.
         cfg: Configuration dictionary.
@@ -74,10 +75,10 @@ def predict_fastsam_mask(
     global _prev_mask
 
     uncer_cfg = cfg["tracking"]["uncertainty_params"]
-    dynamic_classes = uncer_cfg.get("fastsam_dynamic_classes", DEFAULT_DYNAMIC_CLASSES)
-    conf_thresh = uncer_cfg.get("fastsam_confidence_thresh", 0.5)
-    temporal_alpha = uncer_cfg.get("fastsam_temporal_alpha", 0.6)
-    erode_pixels = uncer_cfg.get("fastsam_erode_pixels", 2)
+    dynamic_classes = uncer_cfg.get("seg_dynamic_classes", DEFAULT_DYNAMIC_CLASSES)
+    conf_thresh = uncer_cfg.get("seg_confidence_thresh", 0.5)
+    temporal_alpha = uncer_cfg.get("seg_temporal_alpha", 0.6)
+    erode_pixels = uncer_cfg.get("seg_erode_pixels", 2)
     down_scale = 8
 
     H, W = input_tensor.shape[-2], input_tensor.shape[-1]
@@ -141,7 +142,7 @@ def predict_fastsam_mask(
 
     if save_mask:
         output_dir = f"{cfg['data']['output']}/{cfg['scene']}"
-        mask_dir = f"{output_dir}/mono_priors/fastsam_masks"
+        mask_dir = f"{output_dir}/mono_priors/seg_masks"
         os.makedirs(mask_dir, exist_ok=True)
         np.save(f"{mask_dir}/{idx:05d}.npy", mask_ds.cpu().numpy())
 

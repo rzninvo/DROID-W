@@ -120,11 +120,11 @@ class Frontend:
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
 
-        # Fuse FastSAM mask into propagated uncertainty
-        if self.video.use_fastsam and self.video.fastsam_masks is not None:
-            fastsam_max = self.video.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
-            fastsam_uncer = self.video.fastsam_masks[self.t1] * fastsam_max
-            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], fastsam_uncer)
+        # Fuse segmentation mask into propagated uncertainty
+        if self.video.use_seg and self.video.seg_masks is not None:
+            seg_max = self.video.cfg['tracking']['uncertainty_params'].get('seg_max_uncertainty', 1.5)
+            seg_uncer = self.video.seg_masks[self.t1] * seg_max
+            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], seg_uncer)
 
         # update visualization
         self.video.set_dirty(self.graph.ii.min(), self.t1)
@@ -165,11 +165,11 @@ class Frontend:
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
 
-        # Fuse FastSAM mask into propagated uncertainty
-        if self.video.use_fastsam and self.video.fastsam_masks is not None:
-            fastsam_max = self.video.cfg['tracking']['uncertainty_params'].get('fastsam_max_uncertainty', 1.5)
-            fastsam_uncer = self.video.fastsam_masks[self.t1] * fastsam_max
-            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], fastsam_uncer)
+        # Fuse segmentation mask into propagated uncertainty
+        if self.video.use_seg and self.video.seg_masks is not None:
+            seg_max = self.video.cfg['tracking']['uncertainty_params'].get('seg_max_uncertainty', 1.5)
+            seg_uncer = self.video.seg_masks[self.t1] * seg_max
+            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], seg_uncer)
 
         # initialization complete
         self.is_initialized = True
