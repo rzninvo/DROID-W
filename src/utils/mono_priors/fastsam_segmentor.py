@@ -24,6 +24,9 @@ DEFAULT_DYNAMIC_CLASSES = [
     19,  # cow
 ]
 
+# Stores the previous mask for temporal smoothing
+_prev_mask = None
+
 
 def get_fastsam_model(cfg: Dict):
     """
@@ -68,9 +71,13 @@ def predict_fastsam_mask(
     Returns:
         torch.Tensor: Binary mask at (H/8, W/8) with 1.0 = dynamic, 0.0 = static.
     """
+    global _prev_mask
+
     uncer_cfg = cfg["tracking"]["uncertainty_params"]
     dynamic_classes = uncer_cfg.get("fastsam_dynamic_classes", DEFAULT_DYNAMIC_CLASSES)
     conf_thresh = uncer_cfg.get("fastsam_confidence_thresh", 0.5)
+    temporal_alpha = uncer_cfg.get("fastsam_temporal_alpha", 0.6)
+    erode_pixels = uncer_cfg.get("fastsam_erode_pixels", 2)
     down_scale = 8
 
     H, W = input_tensor.shape[-2], input_tensor.shape[-1]
@@ -106,6 +113,16 @@ def predict_fastsam_mask(
                         ).squeeze()
                     mask_full = torch.max(mask_full, seg_mask.to(device).float())
 
+    # Erode mask to remove noisy edges and background bleed
+    if erode_pixels > 0:
+        kernel_size = 2 * erode_pixels + 1
+        mask_full = -F.max_pool2d(
+            -mask_full.unsqueeze(0).unsqueeze(0),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=erode_pixels,
+        ).squeeze()
+
     # Downsample to tracking resolution (H/8 x W/8)
     mask_ds = F.interpolate(
         mask_full.unsqueeze(0).unsqueeze(0),
@@ -113,6 +130,11 @@ def predict_fastsam_mask(
         mode="bilinear",
         align_corners=False,
     ).squeeze()
+
+    # Temporal smoothing: blend with previous frame to reduce flickering
+    if _prev_mask is not None and _prev_mask.shape == mask_ds.shape:
+        mask_ds = temporal_alpha * mask_ds + (1 - temporal_alpha) * _prev_mask
+    _prev_mask = mask_ds.clone()
 
     # Binarize
     mask_ds = (mask_ds > 0.5).float()

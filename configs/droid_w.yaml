@@ -134,6 +134,8 @@ tracking:
     fastsam_dynamic_classes: [0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19]
     fastsam_max_uncertainty: 1.5    # uncertainty value assigned to detected dynamic pixels
     fastsam_confidence_thresh: 0.5  # FastSAM detection confidence threshold
+    fastsam_temporal_alpha: 0.6     # blend weight for current frame (1.0 = no smoothing)
+    fastsam_erode_pixels: 2         # erode mask edges by N pixels (0 = disabled)
     
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
