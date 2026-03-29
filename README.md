@@ -52,49 +52,57 @@ Given a casually captured in-the-wild video, DROID-W estimates accurate camera t
 
 ## Installation
 
-1. First you have to make sure that you clone the repo with the `--recursive` flag.
-The simplest way to do so, is to use [anaconda](https://www.anaconda.com/). 
+### Requirements
+- NVIDIA GPU with CUDA 12.8+ support (tested on RTX 5090 / Blackwell)
+- Anaconda or Miniconda
+- CUDA Toolkit 12.8+ installed on the system (`nvcc --version` to verify)
+
+### Steps
+
+1. Clone the repo with submodules.
 ```bash
-git clone --recursive https://github.com/MoyangLi00/DROID-W.git
+git clone --recursive https://github.com/rzninvo/DROID-W.git
 cd DROID-W
 ```
 
-2. Creating a new conda environment. 
+2. Create conda environment.
 ```bash
-conda create --name droid-w python=3.10
+conda create --name droid-w python=3.11
 conda activate droid-w
 ```
 
-3. Install CUDA 11.8 and torch-related pacakges
+3. Install PyTorch with CUDA 12.8.
 ```bash
-pip install numpy==1.26.3
-conda install --channel "nvidia/label/cuda-11.8.0" cuda-toolkit
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
-pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-2.1.0+cu118.html
-pip3 install -U xformers==0.0.22.post7+cu118 --index-url https://download.pytorch.org/whl/cu118
+pip install numpy==1.26.3 torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+pip install nvidia-cudnn-cu12 --upgrade
 ```
 
-4. Install the remaining dependencies.
+4. Install CUDA extensions.
 ```bash
 python -m pip install -e thirdparty/lietorch --no-build-isolation
 python -m pip install -e thirdparty/diff-gaussian-rasterization-w-pose --no-build-isolation
 python -m pip install -e thirdparty/simple-knn --no-build-isolation
+python -m pip install -e . --no-build-isolation
 ```
 
-5. Check installation.
+5. Install remaining dependencies.
 ```bash
-python -c "import torch; import lietorch; import simple_knn; import diff_gaussian_rasterization; print(torch.cuda.is_available())"
-```
-6. Now install the droid backends and the other requirements
-```bash
-python -m pip install -e . --no-build-isolation
 python -m pip install -r requirements.txt
 ```
-7. Install MMCV (used by metric depth estimator)
+
+6. Verify installation.
 ```bash
-pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1.0/index.html
+python -c "import torch; import lietorch; import droid_backends; import diff_gaussian_rasterization; from simple_knn._C import distCUDA2; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0)}')"
 ```
-8. Download the pretained models [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing), put it inside the `pretrained` folder.
+
+7. Download the pretrained model [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing) and place it in the `pretrained` folder.
+```bash
+mkdir -p pretrained
+# Download droid.pth and move it to ./pretrained/droid.pth
+```
+
+> **Note:** The `mmcv` package (used by Metric3D) does not currently have pre-built wheels for CUDA 12.8. The code has been patched to make this dependency optional — Metric3D will work without it.
 
 ## Run
 
@@ -105,7 +113,7 @@ bash scripts_downloading/download_bonn.sh
 ```
 You can run DROID-W via the following command:
 ```bash
-python run.py  ./configs/Dynamic/Bonn/{config_file}
+python run.py --config ./configs/Dynamic/Bonn/{config_file}
 ```
 We have prepared config files for the 8 sequences. Note that this dataset needs preprocessing the pose. We have implemented that in the dataloader. If you want to test with sequences other than the ones provided, don't forget to specify ```dataset: 'bonn_dynamic'``` in your config file. The easiest way is to inherit from ```bonn_dynamic.yaml```.
 
