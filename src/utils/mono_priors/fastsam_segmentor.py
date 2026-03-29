@@ -77,7 +77,10 @@ def predict_fastsam_mask(
     h_ds, w_ds = H // down_scale, W // down_scale
 
     # Convert to uint8 numpy HWC for ultralytics inference
-    img_np = (input_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    img = input_tensor.cpu()
+    if img.dim() == 4:
+        img = img.squeeze(0)
+    img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
     results = model.predict(img_np, conf=conf_thresh, verbose=False)
 
