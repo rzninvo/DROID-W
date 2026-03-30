@@ -131,11 +131,37 @@ tracking:
     enable_affine_transform: True
     enable_bidirectional_uncer: False
     use_seg: True
-    seg_dynamic_classes: [0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19]
-    seg_max_uncertainty: 1.5        # uncertainty value assigned to detected dynamic pixels
+    seg_max_uncertainty: 1.5        # uncertainty value assigned to masked dynamic pixels
     seg_confidence_thresh: 0.5      # detection confidence threshold
     seg_temporal_alpha: 0.6         # blend weight for current frame (1.0 = no smoothing)
     seg_erode_pixels: 2             # erode mask edges by N pixels (0 = disabled)
+    # Full vocabulary for YOLO-World open-vocab detection (detects everything for scene graphs)
+    seg_classes: [
+      "person", "pedestrian", "cyclist",
+      "car", "bus", "truck", "motorcycle", "bicycle", "scooter", "van", "taxi", "ambulance", "train",
+      "dog", "cat", "bird", "horse", "cow", "sheep",
+      "skateboard", "stroller", "wheelchair", "shopping cart",
+      "umbrella", "bag", "backpack", "suitcase",
+      "chair", "office chair", "table", "desk", "couch", "bed",
+      "door", "cabinet", "drawer", "shelf", "bookcase",
+      "laptop", "monitor", "phone", "keyboard", "mouse",
+      "cup", "bottle", "plate", "bowl", "book",
+      "lamp", "clock", "vase", "plant", "potted plant",
+      "bench", "trash can", "fire hydrant", "mailbox",
+      "traffic light", "stop sign", "parking meter",
+      "flag", "sign", "pole", "cone",
+      "tv", "microwave", "oven", "refrigerator", "sink",
+      "toilet", "fan", "robot vacuum", "toy", "ball"
+    ]
+    # Subset used for SLAM dynamic mask (likely-moving objects only).
+    # Everything else is still detected and saved for scene graphs,
+    # but only masked if DROID-W's uncertainty confirms actual motion.
+    seg_mask_classes: [
+      "person", "pedestrian", "cyclist",
+      "car", "bus", "truck", "motorcycle", "bicycle", "scooter", "van", "taxi", "ambulance", "train",
+      "dog", "cat", "bird", "horse", "cow", "sheep",
+      "skateboard", "stroller", "wheelchair"
+    ]
     
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
@@ -161,7 +187,7 @@ mono_prior:
   save_depth: False
   feature_extractor: 'dinov2_reg_small_fine'
   save_feature: False
-  seg_model: 'yolov8s-seg.pt'
+  seg_model: 'yolov8s-worldv2.pt'
   save_seg_mask: False
 
 data:
