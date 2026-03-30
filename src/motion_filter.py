@@ -6,10 +6,9 @@ from src.modules.droid_net import CorrBlock
 from src.utils.mono_priors.metric_depth_estimators import get_metric_depth_estimator, predict_metric_depth
 from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
-from src.utils.mono_priors.seg_model import get_seg_model, predict_seg_mask
 
 class MotionFilter:
-    """ This class is used to filter incoming frames and extract features 
+    """ This class is used to filter incoming frames and extract features
         mainly inherited from DROID-SLAM
     """
 
@@ -29,17 +28,13 @@ class MotionFilter:
         # mean, std for image normalization
         self.MEAN = torch.as_tensor([0.485, 0.456, 0.406], device=self.device)[:, None, None]
         self.STDV = torch.as_tensor([0.229, 0.224, 0.225], device=self.device)[:, None, None]
-        
+
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
         self.save_dir = cfg['data']['output'] + '/' + cfg['scene']
         self.metric_depth_estimator = get_metric_depth_estimator(cfg)
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
-
-        self.use_seg = cfg['tracking']['uncertainty_params'].get('use_seg', False)
-        if self.use_seg:
-            self.seg_model = get_seg_model(cfg)
 
     @torch.amp.autocast('cuda',enabled=True)
     def __context_encoder(self, image):
@@ -82,11 +77,9 @@ class MotionFilter:
                 if self.cfg['mapping']["uncertainty_params"]['activate']:
                     # If mapping needs dino features, we predict here and store the value in local disk
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
-            seg_mask = predict_seg_mask(self.seg_model, tstamp, image, self.cfg, self.device,
-                                                save_mask=self.cfg['mono_prior'].get('save_seg_mask', False)) if self.use_seg else None
-            self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features, seg_mask)
+            self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
         ### only add new frame if there is enough motion ###
-        else:                
+        else:
             # index correlation volume
             coords0 = pops.coords_grid(ht, wd, device=self.device)[None,None]
             corr = CorrBlock(self.fmap[None,[0]], gmap[None,[0]])(coords0)
@@ -113,10 +106,8 @@ class MotionFilter:
                     if self.cfg['mapping']["uncertainty_params"]['activate']:
                         # if mapping needs dino features, we predict here and store the value in local disk
                         _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
-                seg_mask = predict_seg_mask(self.seg_model, tstamp, image, self.cfg, self.device,
-                                                    save_mask=self.cfg['mono_prior'].get('save_seg_mask', False)) if self.use_seg else None
                 # add new frame to video, all params
-                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features, seg_mask)     # video.counter += 1
+                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)     # video.counter += 1
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
             else:
                 self.count += 1

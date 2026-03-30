@@ -120,12 +120,6 @@ class Frontend:
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
 
-        # Fuse segmentation mask into propagated uncertainty
-        if self.video.use_seg and self.video.seg_masks is not None:
-            seg_max = self.video.cfg['tracking']['uncertainty_params'].get('seg_max_uncertainty', 1.5)
-            seg_uncer = self.video.seg_masks[self.t1] * seg_max
-            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], seg_uncer)
-
         # update visualization
         self.video.set_dirty(self.graph.ii.min(), self.t1)
         torch.cuda.empty_cache()
@@ -164,12 +158,6 @@ class Frontend:
             self.video.uncertainties[self.t1] = torch.log(1.1 + torch.exp(y_cdot))
         else:
             self.video.uncertainties[self.t1] = self.video.uncertainties[self.t1-1].detach().clone()
-
-        # Fuse segmentation mask into propagated uncertainty
-        if self.video.use_seg and self.video.seg_masks is not None:
-            seg_max = self.video.cfg['tracking']['uncertainty_params'].get('seg_max_uncertainty', 1.5)
-            seg_uncer = self.video.seg_masks[self.t1] * seg_max
-            self.video.uncertainties[self.t1] = torch.max(self.video.uncertainties[self.t1], seg_uncer)
 
         # initialization complete
         self.is_initialized = True
