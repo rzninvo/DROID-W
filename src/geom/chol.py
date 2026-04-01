@@ -22,8 +22,7 @@ class CholeskySolver():
 
     def apply(H,b):
         try:
-            U = torch.linalg.cholesky(H)
-            xs = torch.cholesky_solve(b, U)
+            xs = torch.linalg.solve(H, b)
         except Exception as e:
             print(e)
             xs = torch.zeros_like(b)
@@ -50,7 +49,7 @@ class CholeskySolver():
             return None, None
 
         U, xs = ctx.saved_tensors
-        dz = torch.cholesky_solve(grad_x, U)
+        dz = torch.linalg.solve_triangular(U, torch.linalg.solve_triangular(U.transpose(-1, -2), grad_x, upper=True), upper=False)
         dH = -torch.matmul(xs, dz.transpose(-1,-2))
 
         return dH, dz

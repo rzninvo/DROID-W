@@ -3,7 +3,6 @@ import numpy as np
 
 from src.modules.droid_net import CorrBlock, AltCorrBlock
 import src.geom.projective_ops as pops
-from copy import deepcopy
 
 
 class FactorGraph:
@@ -452,16 +451,11 @@ class FactorGraph:
                 d[(i-t0)*(t-t1) + (j-t1)] = np.inf
 
         ix = torch.argsort(d)
-        for k in ix:
-            if d[k].item() > thresh:
-                continue
-        
-        # ix = torch.argsort(d)
-        # d_sorted = d[ix]
-        # stop = torch.searchsorted(d_sorted, torch.tensor(thresh, device=d.device, dtype=d.dtype), right=True)
-        # ix = ix[:stop]                        # only candidates within threshold
-        # for k in ix:
+        d_sorted = d[ix]
+        stop = torch.searchsorted(d_sorted, torch.tensor(thresh, device=d.device, dtype=d.dtype), right=True).item()
+        ix = ix[:stop]
 
+        for k in ix:
             if len(es) > self.max_factors:
                 break
 
@@ -472,15 +466,17 @@ class FactorGraph:
             es.append((i, j))
             es.append((j, i))
 
-            # nms for newly added edges
-            for di in range(-nms, nms+1):
-                for dj in range(-nms, nms+1):
-                    if abs(di) + abs(dj) <= max(min(abs(i-j)-2, nms), 0):
-                        i1 = i + di
-                        j1 = j + dj
-
-                        if (t0 <= i1 < t) and (t1 <= j1 < t):
-                            d[(i1-t0)*(t-t1) + (j1-t1)] = np.inf
+            # nms for newly added edges — vectorized offset invalidation
+            nms_radius = max(min(abs(i-j)-2, nms), 0)
+            if nms_radius > 0:
+                di_offsets, dj_offsets, manhattan = self.precompute_offsets(nms)
+                valid = manhattan <= nms_radius
+                i1 = i + di_offsets[valid]
+                j1 = j + dj_offsets[valid]
+                in_bounds = (i1 >= t0) & (i1 < t) & (j1 >= t1) & (j1 < t)
+                i1 = i1[in_bounds]
+                j1 = j1[in_bounds]
+                d[(i1-t0)*(t-t1) + (j1-t1)] = np.inf
 
         ii, jj = torch.as_tensor(es, device=self.device).unbind(dim=-1)
         self.add_factors(ii, jj, remove)
@@ -501,7 +497,7 @@ class FactorGraph:
         jj = jj.reshape(-1)
 
         d = self.video.distance(ii, jj, beta=beta)
-        rawd = deepcopy(d).reshape(ilen, jlen)
+        rawd = d.clone().reshape(ilen, jlen)
         d[ii - radius < jj] = np.inf
         d[d > thresh] = np.inf
         d = d.reshape(ilen, jlen)
@@ -526,7 +522,7 @@ class FactorGraph:
         n_neighboring = 1
         for k in ix:
             di, dj = k // jlen, k % jlen
-            if d[di,dj].item() > thresh:
+            if d[di,dj] > thresh:
                 continue
 
             if len(es) > max_factors:

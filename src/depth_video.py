@@ -166,12 +166,6 @@ class DepthVideo:
                     self.temp_y_cdot[index] = y_cdot
                     self.uncertainties[index] = torch.log(1.1 + torch.exp(y_cdot))
                     
-            # constrain the uncertainty of similar dino feats to be similar (TODO:unused in current implementation)
-            # Compute pairwise similarity between all pixels within each frame
-            # normalize the dino feats
-            dino_feats_normalized = F.normalize(self.dino_feats_resize[index], p=2, dim=-3)
-            dino_feats_tmp = dino_feats_normalized  # [1, C, H, W]
-            C, H, W = dino_feats_tmp.shape[-3:]
 
     def __setitem__(self, index, item):
         with self.get_lock():

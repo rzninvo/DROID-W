@@ -18,31 +18,41 @@ import torch.nn.functional as F
 from .chol import block_solve, schur_solve
 import src.geom.projective_ops as pops
 
-from torch_scatter import scatter_sum
+
+
+def _scatter_sum(src, index, dim=0, dim_size=None):
+    """Native PyTorch replacement for torch_scatter.scatter_sum."""
+    if dim_size is None:
+        dim_size = int(index.max()) + 1
+    shape = list(src.shape)
+    shape[dim] = dim_size
+    out = torch.zeros(shape, dtype=src.dtype, device=src.device)
+    idx = index.unsqueeze(-1).expand_as(src) if src.dim() > index.dim() else index
+    return out.scatter_add_(dim, idx, src)
 
 
 # utility functions for scattering ops
 def safe_scatter_add_mat(A, ii, jj, n, m):
     v = (ii >= 0) & (jj >= 0) & (ii < n) & (jj < m)
-    return scatter_sum(A[:,v], ii[v]*m + jj[v], dim=1, dim_size=n*m)
+    return _scatter_sum(A[:,v], ii[v]*m + jj[v], dim=1, dim_size=n*m)
 
 def safe_scatter_add_vec(b, ii, n):
     v = (ii >= 0) & (ii < n)
-    return scatter_sum(b[:,v], ii[v], dim=1, dim_size=n)
+    return _scatter_sum(b[:,v], ii[v], dim=1, dim_size=n)
 
 # apply retraction operator to inv-depth maps
 def disp_retr(disps, dz, ii):
     ii = ii.to(device=dz.device)
-    return disps + scatter_sum(dz, ii, dim=1, dim_size=disps.shape[1])
+    return disps + _scatter_sum(dz, ii, dim=1, dim_size=disps.shape[1])
 
 def wq_retr(wqs, dwq, ii):
     ii = ii.to(device=dwq.device)
-    return wqs + scatter_sum(dwq, ii, dim=1, dim_size=wqs.shape[1])
+    return wqs + _scatter_sum(dwq, ii, dim=1, dim_size=wqs.shape[1])
 
 # apply retraction operator to poses
 def pose_retr(poses, dx, ii):
     ii = ii.to(device=dx.device)
-    return poses.retr(scatter_sum(dx, ii, dim=1, dim_size=poses.shape[1]))
+    return poses.retr(_scatter_sum(dx, ii, dim=1, dim_size=poses.shape[1]))
 
 @torch.no_grad()
 def BA(target, weight, eta, poses, disps, intrinsics, ii, jj, 

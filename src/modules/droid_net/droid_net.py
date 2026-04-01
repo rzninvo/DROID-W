@@ -15,7 +15,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean
+
+def _scatter_mean(src, index, dim=0):
+    """Native PyTorch replacement for torch_scatter.scatter_mean."""
+    dim_size = int(index.max()) + 1
+    shape = list(src.shape)
+    shape[dim] = dim_size
+    out_sum = torch.zeros(shape, dtype=src.dtype, device=src.device)
+    count = torch.zeros(shape, dtype=src.dtype, device=src.device)
+    idx_shape = [1] * src.dim()
+    idx_shape[dim] = -1
+    idx = index.view(idx_shape).expand_as(src)
+    out_sum.scatter_add_(dim, idx, src)
+    ones = torch.ones_like(src)
+    count.scatter_add_(dim, idx, ones)
+    return out_sum / count.clamp(min=1)
 
 from src.modules.droid_net import ConvGRU, BasicEncoder, GradientClip
 
@@ -70,7 +84,7 @@ class GraphAgg(nn.Module):
         net = self.relu(self.conv1(net))
         net =net.view(batch, num, 128, ht, wd)
 
-        net = scatter_mean(net, ix, dim=1)
+        net = _scatter_mean(net, ix, dim=1)
         net = net.view(-1, 128, ht, wd)
         
         net = self.relu(self.conv2(net))

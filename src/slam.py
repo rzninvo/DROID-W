@@ -50,6 +50,7 @@ class SLAM:
         self.num_running_thread.share_memory_()
         self.all_trigered = torch.zeros((1)).int()
         self.all_trigered.share_memory_()
+        self.startup_barrier = None  # set in run() based on process count
 
         self.video = DepthVideo(cfg, self.printer)
         self.ba = Backend(self.droid_net, self.video, self.cfg)
@@ -100,8 +101,8 @@ class SLAM:
         os.makedirs(f"{self.save_dir}/mono_priors/depths", exist_ok=True)
         os.makedirs(f"{self.save_dir}/mono_priors/features", exist_ok=True)
 
-        while self.all_trigered < self.num_running_thread:
-            pass
+        if self.startup_barrier is not None:
+            self.startup_barrier.wait()
         self.printer.pbar_ready()
         self.tracker.run(self.stream)
         self.printer.print("Tracking Done!", FontColor.TRACKER)
@@ -116,8 +117,8 @@ class SLAM:
         self.all_trigered += 1
         setup_seed(self.cfg["setup_seed"])
 
-        while self.all_trigered < self.num_running_thread:
-            pass
+        if self.startup_barrier is not None:
+            self.startup_barrier.wait()
         self.mapper.run()
         self.printer.print("Mapping Done!", FontColor.MAPPER)
 
@@ -133,9 +134,7 @@ class SLAM:
             self.video.metric_depth_reg = False
 
         self.ba = Backend(self.droid_net, self.video, self.cfg)
-        torch.cuda.empty_cache()
         self.ba.dense_ba(7, enable_udba=self.cfg['tracking']['frontend']['enable_opt_dyn_mask'])
-        torch.cuda.empty_cache()
         self.ba.dense_ba(12, enable_udba=self.cfg['tracking']['frontend']['enable_opt_dyn_mask'], save_edges_weights=False)
         self.printer.print("Final Global BA Done!", FontColor.TRACKER)
 
@@ -294,6 +293,7 @@ class SLAM:
                 mp.Process(target=self.tracking, args=(t_pipe,)),                       # call tracking() function
             ]
         self.num_running_thread[0] += len(processes)
+        self.startup_barrier = mp.Barrier(len(processes))
         for p in processes:
             p.start()
 
