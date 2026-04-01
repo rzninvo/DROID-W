@@ -10,6 +10,8 @@
 
 import logging
 
+import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
 
@@ -17,13 +19,7 @@ from torch import nn
 logger = logging.getLogger("dinov2")
 
 
-try:
-    from xformers.ops import memory_efficient_attention, unbind, fmha
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    logger.warning("xFormers not available")
-    XFORMERS_AVAILABLE = False
+XFORMERS_AVAILABLE = False
 
 
 class Attention(nn.Module):
@@ -64,17 +60,12 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if not XFORMERS_AVAILABLE:
-            assert attn_bias is None, "xFormers is required for nested tensors usage"
-            return super().forward(x)
-
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # [B, num_heads, N, head_dim]
 
-        q, k, v = unbind(qkv, 2)
-
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-        x = x.reshape([B, N, C])
+        x = F.scaled_dot_product_attention(q, k, v)  # auto-dispatches to FlashAttention-2 / cuDNN 9
+        x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
         x = self.proj_drop(x)
