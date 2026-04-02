@@ -65,6 +65,91 @@ Done with overwriting get_intermediate_layers of FiT3D model
 """
 
 
+def _create_dinov3_model(extractor_model: str, device: str) -> nn.Module:
+    """Load DINOv3 ViT-S/16 from torch hub with HuggingFace weights."""
+    import os
+    hub_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov3_main")
+
+    # Download hub repo if not cached
+    if not os.path.isdir(hub_dir):
+        torch.hub.load("facebookresearch/dinov3", extractor_model, pretrained=False)
+
+    # Build model without pretrained weights
+    model = torch.hub.load(hub_dir, extractor_model, source="local", pretrained=False)
+
+    # Load converted checkpoint (HF safetensors -> torch hub format)
+    ckpt_path = os.path.expanduser(
+        "~/.cache/torch/hub/checkpoints/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+    )
+    if not os.path.isfile(ckpt_path):
+        # Convert HuggingFace safetensors to torch hub format on first run
+        _convert_dinov3_hf_to_hub(model, ckpt_path)
+    else:
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=False)
+
+    return model.to(device).eval()
+
+
+def _convert_dinov3_hf_to_hub(model: nn.Module, save_path: str) -> None:
+    """Convert DINOv3 HuggingFace safetensors to torch hub state dict format."""
+    import os
+    from safetensors.torch import load_file
+    from huggingface_hub import hf_hub_download
+
+    hf_path = hf_hub_download(
+        "facebook/dinov3-vits16-pretrain-lvd1689m", "model.safetensors"
+    )
+    hf_state = load_file(hf_path)
+    hub_state = model.state_dict()
+    new_state = {}
+
+    # Embeddings
+    new_state["cls_token"] = hf_state["embeddings.cls_token"]
+    new_state["patch_embed.proj.weight"] = hf_state["embeddings.patch_embeddings.weight"]
+    new_state["patch_embed.proj.bias"] = hf_state["embeddings.patch_embeddings.bias"]
+    new_state["storage_tokens"] = hf_state["embeddings.register_tokens"]
+    new_state["norm.weight"] = hf_state["norm.weight"]
+    new_state["norm.bias"] = hf_state["norm.bias"]
+    if "mask_token" in hub_state:
+        mt = hf_state["embeddings.mask_token"]
+        if hub_state["mask_token"].shape != mt.shape:
+            mt = mt.squeeze(0)
+        new_state["mask_token"] = mt
+
+    # Transformer blocks
+    num_layers = sum(1 for k in hf_state if k.startswith("layer.") and k.endswith(".norm1.weight"))
+    for i in range(num_layers):
+        q_w = hf_state[f"layer.{i}.attention.q_proj.weight"]
+        k_w = hf_state[f"layer.{i}.attention.k_proj.weight"]
+        v_w = hf_state[f"layer.{i}.attention.v_proj.weight"]
+        new_state[f"blocks.{i}.attn.qkv.weight"] = torch.cat([q_w, k_w, v_w], dim=0)
+        q_b = hf_state[f"layer.{i}.attention.q_proj.bias"]
+        k_b = hf_state.get(f"layer.{i}.attention.k_proj.bias", torch.zeros_like(q_b))
+        v_b = hf_state[f"layer.{i}.attention.v_proj.bias"]
+        new_state[f"blocks.{i}.attn.qkv.bias"] = torch.cat([q_b, k_b, v_b], dim=0)
+        new_state[f"blocks.{i}.attn.proj.weight"] = hf_state[f"layer.{i}.attention.o_proj.weight"]
+        new_state[f"blocks.{i}.attn.proj.bias"] = hf_state[f"layer.{i}.attention.o_proj.bias"]
+        new_state[f"blocks.{i}.ls1.gamma"] = hf_state[f"layer.{i}.layer_scale1.lambda1"]
+        new_state[f"blocks.{i}.ls2.gamma"] = hf_state[f"layer.{i}.layer_scale2.lambda1"]
+        new_state[f"blocks.{i}.mlp.fc1.weight"] = hf_state[f"layer.{i}.mlp.up_proj.weight"]
+        new_state[f"blocks.{i}.mlp.fc1.bias"] = hf_state[f"layer.{i}.mlp.up_proj.bias"]
+        new_state[f"blocks.{i}.mlp.fc2.weight"] = hf_state[f"layer.{i}.mlp.down_proj.weight"]
+        new_state[f"blocks.{i}.mlp.fc2.bias"] = hf_state[f"layer.{i}.mlp.down_proj.bias"]
+        new_state[f"blocks.{i}.norm1.weight"] = hf_state[f"layer.{i}.norm1.weight"]
+        new_state[f"blocks.{i}.norm1.bias"] = hf_state[f"layer.{i}.norm1.bias"]
+        new_state[f"blocks.{i}.norm2.weight"] = hf_state[f"layer.{i}.norm2.weight"]
+        new_state[f"blocks.{i}.norm2.bias"] = hf_state[f"layer.{i}.norm2.bias"]
+
+    # Copy non-learned buffers (bias_mask, rope_embed)
+    for k in set(hub_state.keys()) - set(new_state.keys()):
+        new_state[k] = hub_state[k]
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(new_state, save_path)
+    model.load_state_dict(new_state, strict=False)
+
+
 def get_feature_extractor(cfg: Dict) -> nn.Module:
     """
     Get the feature extractor model based on the configuration.
@@ -79,7 +164,7 @@ def get_feature_extractor(cfg: Dict) -> nn.Module:
             torch.hub.load("facebookresearch/dinov2", extractor_model).to(device).eval()
         )
     elif extractor_model in ["dinov3_vits16", "dinov3_vits16plus"]:
-        return None
+        return _create_dinov3_model(extractor_model, device)
     else:
         # If use other feature extractor as prior, add code here
         raise NotImplementedError("Unsupported feature extractor")
@@ -140,10 +225,10 @@ def predict_img_features(
             image_resized.shape[2] // 14, image_resized.shape[3] // 14, -1
         )
     elif extractor_model in ["dinov3_vits16", "dinov3_vits16plus"]:
-        output_dir = f"{cfg['data']['output']}/{cfg['scene']}"
-        output_path = f"{output_dir}/mono_priors/features/{idx:05d}{suffix}.npy"
-        features = torch.from_numpy(np.load(output_path)).to(device)
-        return features
+        features_dict = model.forward_features(image_resized)
+        features = features_dict["x_norm_patchtokens"].view(
+            image_resized.shape[2] // 16, image_resized.shape[3] // 16, -1
+        )
     else:
         # If use other feature extractor as prior, add code here
         raise NotImplementedError("Unsupported feature extractor")
