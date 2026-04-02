@@ -73,8 +73,8 @@ def BA(target, weight, eta, poses, disps, intrinsics, ii, jj,
     ### 2: construct linear system ###
     Ji = Ji.reshape(B, N, -1, D)        #[B,N,2*ht*wd,D]
     Jj = Jj.reshape(B, N, -1, D)        #[B,N,2*ht*wd,D]
-    wJiT = (w * Ji).transpose(2,3)      #[B,N,D,2*ht*wd]
-    wJjT = (w * Jj).transpose(2,3)      #[B,N,D,2*ht*wd]
+    wJiT = (w * Ji).transpose(2,3).contiguous()  #[B,N,D,2*ht*wd]
+    wJjT = (w * Jj).transpose(2,3).contiguous()  #[B,N,D,2*ht*wd]
 
     Jz = Jz.reshape(B, N, ht*wd, -1)    #[B,N,ht*wd,2]
 
@@ -192,7 +192,7 @@ def BA_with_scale_shift(target, weight, eta, poses, disps, intrinsics, ii, jj,
     J_shift[invalid_mask] = 0
 
     J_wq = torch.cat([J_scale,J_shift],dim=3)         #[B,M,ht*wd,2]
-    J_wq_T = J_wq.transpose(2,3)         #[B,M,2,ht*wd]
+    J_wq_T = J_wq.transpose(2,3).contiguous()  #[B,M,2,ht*wd]
     H_wq = torch.matmul(J_wq_T, J_wq)   #[B,M,2,2]
     u = - torch.matmul(J_wq_T, r_depth).squeeze(-1) #[B,M,2]
     ### 2: construct linear system ###
@@ -261,8 +261,8 @@ def MoBA(target, weight, eta, poses, disps, intrinsics, ii, jj, fixedp=1, rig=1)
     ### 2: construct linear system ###
     Ji = Ji.reshape(B, N, -1, D)
     Jj = Jj.reshape(B, N, -1, D)
-    wJiT = (w * Ji).transpose(2,3)
-    wJjT = (w * Jj).transpose(2,3)
+    wJiT = (w * Ji).transpose(2,3).contiguous()
+    wJjT = (w * Jj).transpose(2,3).contiguous()
 
     Hii = torch.matmul(wJiT, Ji)
     Hij = torch.matmul(wJiT, Jj)

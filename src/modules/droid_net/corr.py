@@ -85,7 +85,8 @@ class CorrBlock:
         fmap1 = fmap1.reshape(batch*num, dim, ht*wd) / 4.0
         fmap2 = fmap2.reshape(batch*num, dim, ht*wd) / 4.0
 
-        corr = torch.matmul(fmap1.transpose(1, 2), fmap2)
+        # Use FP16 for correlation matmul (2-3x faster, correlation is a similarity score)
+        corr = torch.matmul(fmap1.half().transpose(1, 2), fmap2.half()).float()
 
         return corr.view(batch, num, ht, wd, ht, wd)
 

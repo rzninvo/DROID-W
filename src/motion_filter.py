@@ -8,7 +8,7 @@ from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
 
 class MotionFilter:
-    """ This class is used to filter incoming frames and extract features 
+    """ This class is used to filter incoming frames and extract features
         mainly inherited from DROID-SLAM
     """
 
@@ -28,13 +28,16 @@ class MotionFilter:
         # mean, std for image normalization
         self.MEAN = torch.as_tensor([0.485, 0.456, 0.406], device=self.device)[:, None, None]
         self.STDV = torch.as_tensor([0.229, 0.224, 0.225], device=self.device)[:, None, None]
-        
+
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
         self.save_dir = cfg['data']['output'] + '/' + cfg['scene']
         self.metric_depth_estimator = get_metric_depth_estimator(cfg)
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
+
+        # Separate CUDA stream for mono prior inference (depth + DINO)
+        self.depth_stream = torch.cuda.Stream(device=device)
 
     @torch.amp.autocast('cuda',enabled=True)
     def __context_encoder(self, image):
@@ -67,15 +70,19 @@ class MotionFilter:
 
         ### always add first frame to the depth video ###
         if self.video.counter.value == 0:
+            # Run depth estimation on separate stream, overlapping with context encoding
+            with torch.cuda.stream(self.depth_stream):
+                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+            # Context encoding on default stream (runs concurrently with depth)
             net, inp = self.__context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
-            mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+            # Sync depth stream before using mono_depth
+            self.depth_stream.synchronize()
             if self.uncertainty_aware:
                 dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=self.cfg['mono_prior']['save_feature'])
             else:
                 dino_features = None
                 if self.cfg['mapping']["uncertainty_params"]['activate']:
-                    # If mapping needs dino features, we predict here and store the value in local disk
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
         ### only add new frame if there is enough motion ###
@@ -96,18 +103,22 @@ class MotionFilter:
             # check motion magnitue / add new frame to video
             if delta.norm(dim=-1).mean().item() > self.thresh or force_to_add_keyframe:
                 self.count = 0
+                # Run depth estimation on separate stream, overlapping with context encoding
+                with torch.cuda.stream(self.depth_stream):
+                    mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+                # Context encoding on default stream (runs concurrently with depth)
                 net, inp = self.__context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
-                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device,save_depth=(self.cfg['mono_prior']['save_depth'] or self.cfg['mapping']["enable"]))
+                # Sync depth stream before using mono_depth
+                self.depth_stream.synchronize()
                 if self.uncertainty_aware:
                     dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=self.cfg['mono_prior']['save_feature'])
                 else:
                     dino_features = None
                     if self.cfg['mapping']["uncertainty_params"]['activate']:
-                        # if mapping needs dino features, we predict here and store the value in local disk
                         _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
                 # add new frame to video, all params
-                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)     # video.counter += 1
+                self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
             else:
                 self.count += 1

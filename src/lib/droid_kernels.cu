@@ -43,6 +43,12 @@ typedef std::vector<torch::Tensor> tensor_list_t;
 #define GPU_1D_KERNEL_LOOP(k, n) \
   for (size_t k = threadIdx.x; k<n; k += blockDim.x)
 
+// Fast integer division: replace expensive k/wd and k%wd with multiply+subtract
+__device__ __forceinline__ void fast_divmod(int k, int wd, int &i, int &j) {
+  i = __float2int_rd(__fdividef((float)k, (float)wd));
+  j = k - i * wd;
+}
+
 
 __device__ void warpReduce(volatile float *sdata, unsigned int tid) {
   sdata[tid] += sdata[tid + 32];
@@ -294,8 +300,8 @@ __global__ void projective_transform_kernel(
 
   GPU_1D_KERNEL_LOOP(k, ht*wd) {
 
-    const int i = k / wd;
-    const int j = k % wd;
+    int i, j;
+    fast_divmod(k, wd, i, j);
 
     const float u = static_cast<float>(j);
     const float v = static_cast<float>(i);
@@ -544,8 +550,8 @@ __global__ void projmap_kernel(
   __syncthreads();
 
   GPU_1D_KERNEL_LOOP(k, ht*wd) {
-    const int i = k / wd;
-    const int j = k % wd;
+    int i, j;
+    fast_divmod(k, wd, i, j);
 
     const float u = static_cast<float>(j);
     const float v = static_cast<float>(i);
@@ -788,8 +794,8 @@ __global__ void depth_filter_kernel(
   __syncthreads();
 
   if (index < ht*wd) {
-    const int i = index / wd;
-    const int j = index % wd;
+    int i, j;
+    fast_divmod(index, wd, i, j);
 
     const float ui = static_cast<float>(j);
     const float vi = static_cast<float>(i);
@@ -883,8 +889,8 @@ __global__ void iproj_kernel(
   float Xj[4];
 
   if (index < ht*wd) {
-    const int i = index / wd;
-    const int j = index % wd;
+    int i, j;
+    fast_divmod(index, wd, i, j);
 
     const float ui = static_cast<float>(j);
     const float vi = static_cast<float>(i);
@@ -1547,8 +1553,8 @@ __global__ void dino_feats_projective_transform_kernel(
 
   GPU_1D_KERNEL_LOOP(k, ht*wd) {
 
-    const int i = k / wd;
-    const int j = k % wd;
+    int i, j;
+    fast_divmod(k, wd, i, j);
 
     const float u = static_cast<float>(j);
     const float v = static_cast<float>(i);
@@ -1707,8 +1713,8 @@ __global__ void prior_regularization_kernel(
 
   GPU_1D_KERNEL_LOOP(k, ht*wd) {
 
-    const int i = k / wd;
-    const int j = k % wd;
+    int i, j;
+    fast_divmod(k, wd, i, j);
     
     // prior loss
     float dLp_duncer = 1.0 / (uncertainties[idx][i][j] + 1.0);
@@ -1740,8 +1746,8 @@ __global__ void linear_transform_kernel(
   const int idx = kx[block_id];
 
   GPU_1D_KERNEL_LOOP(k, ht*wd) {
-    const int i = k / wd;
-    const int j = k % wd;
+    int i, j;
+    fast_divmod(k, wd, i, j);
     float uncer = uncertainties[idx][i][j];
     float y_cdot = temp_y_cdot[idx][i][j];
     float duncer_dy = 1.0 / (1.0 + 1.1 * expf(-y_cdot));
