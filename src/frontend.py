@@ -151,7 +151,7 @@ class Frontend:
         # self.video.normalize()
         self.video.poses[self.t1] = self.video.poses[self.t1-1].clone()
         self.video.disps[self.t1] = self.video.disps[self.t1-4:self.t1].mean()
-        
+
         if self.video.enable_affine_transform:
             y_cdot = self.video.dino_feats_resize[self.t1].permute(1,2,0) @ self.video.affine_weights[:-1] + self.video.affine_weights[-1]
             self.video.temp_y_cdot[self.t1] = y_cdot

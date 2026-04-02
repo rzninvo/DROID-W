@@ -100,6 +100,7 @@ class DepthVideo:
             self.affine_weights = self.affine_weights.squeeze(0).share_memory_()
             self.enable_affine_transform = cfg['tracking']['uncertainty_params']['enable_affine_transform']
             self.temp_y_cdot = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+
         else:
             self.dino_feats = None
             self.dino_feats_resize = None

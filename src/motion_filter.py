@@ -86,7 +86,7 @@ class MotionFilter:
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
         ### only add new frame if there is enough motion ###
-        else:                
+        else:
             # index correlation volume
             coords0 = pops.coords_grid(ht, wd, device=self.device)[None,None]
             corr = CorrBlock(self.fmap[None,[0]], gmap[None,[0]])(coords0)

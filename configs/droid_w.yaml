@@ -130,7 +130,7 @@ tracking:
     gba_weight_decay: 0.002
     enable_affine_transform: True
     enable_bidirectional_uncer: False
-    
+
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 
@@ -158,6 +158,9 @@ mono_prior:
   # Note: DINOv3 requires retraining — feature norm ~8 vs DINOv2's ~16.
   feature_extractor: 'dinov2_reg_small_fine'
   save_feature: False
+  # Post-processing detector for scene graphs (runs outside SLAM loop)
+  detector: 'yolov8s-worldv2.pt'
+  detector_conf: 0.15
 
 data:
   output: ./output/wildgs_slam
