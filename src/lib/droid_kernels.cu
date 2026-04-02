@@ -1217,6 +1217,210 @@ __global__ void EvT6x1_kernel(
   }
 }
 
+// ── CUDA kernel: scatter 6x6 blocks into dense matrix ──────────────
+__global__ void scatter_block6x6_kernel(
+    const float* __restrict__ As,     // [num_entries, 6, 6]
+    const long*  __restrict__ ii,     // [num_entries]
+    const long*  __restrict__ jj,     // [num_entries]
+    float*       __restrict__ H,      // [NM, NM] row-major
+    const int num_entries,
+    const int N,
+    const int NM)                     // NM = N * 6
+{
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = num_entries * 36;
+  if (tid >= total) return;
+
+  const int entry = tid / 36;
+  const int kl = tid % 36;
+  const int k = kl / 6;
+  const int l = kl % 6;
+
+  const int i = ii[entry];
+  const int j = jj[entry];
+  if (i < 0 || j < 0 || i >= N || j >= N) return;
+
+  const int row = 6 * i + k;
+  const int col = 6 * j + l;
+  atomicAdd(&H[row * NM + col], As[entry * 36 + k * 6 + l]);
+}
+
+// ── CUDA kernel: scatter 6-vectors into dense RHS ──────────────────
+__global__ void scatter_vec6_kernel(
+    const float* __restrict__ bs,     // [num_entries, 6]
+    const long*  __restrict__ ii,     // [num_entries]
+    float*       __restrict__ b,      // [NM]
+    const int num_entries,
+    const int N)
+{
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = num_entries * 6;
+  if (tid >= total) return;
+
+  const int entry = tid / 6;
+  const int k = tid % 6;
+  const int i = ii[entry];
+  if (i < 0 || i >= N) return;
+
+  atomicAdd(&b[6 * i + k], bs[entry * 6 + k]);
+}
+
+// ── GPU-resident dense block for BA solve ──────────────────────────
+class DenseBlock {
+  public:
+    torch::Tensor H;  // [N*M, N*M] dense CUDA float32
+    torch::Tensor b;  // [N*M, 1]   dense CUDA float32
+    const int N;
+    const int M;
+
+    DenseBlock(int N, int M) : N(N), M(M) {
+      auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+      H = torch::zeros({N*M, N*M}, opts);
+      b = torch::zeros({N*M, 1}, opts);
+    }
+
+    DenseBlock(torch::Tensor H, torch::Tensor b, int N, int M)
+      : H(H), b(b), N(N), M(M) {}
+
+    void update_lhs(torch::Tensor As, torch::Tensor ii, torch::Tensor jj) {
+      auto ii_cuda = ii.to(torch::kCUDA).to(torch::kInt64).contiguous();
+      auto jj_cuda = jj.to(torch::kCUDA).to(torch::kInt64).contiguous();
+      auto As_contig = As.contiguous();
+      const int n_entries = ii.size(0);
+      const int total = n_entries * 36;
+      const int NM = N * M;
+
+      scatter_block6x6_kernel<<<NUM_BLOCKS(total), THREADS>>>(
+        As_contig.data_ptr<float>(),
+        ii_cuda.data_ptr<long>(),
+        jj_cuda.data_ptr<long>(),
+        H.data_ptr<float>(),
+        n_entries, N, NM);
+    }
+
+    void update_rhs(torch::Tensor bs, torch::Tensor ii) {
+      auto ii_cuda = ii.to(torch::kCUDA).to(torch::kInt64).contiguous();
+      auto bs_contig = bs.contiguous();
+      const int n_entries = ii.size(0);
+      const int total = n_entries * 6;
+
+      scatter_vec6_kernel<<<NUM_BLOCKS(total), THREADS>>>(
+        bs_contig.data_ptr<float>(),
+        ii_cuda.data_ptr<long>(),
+        b.data_ptr<float>(),
+        n_entries, N);
+    }
+
+    DenseBlock operator-(const DenseBlock& S) const {
+      return DenseBlock(H - S.H, b - S.b, N, M);
+    }
+
+    torch::Tensor solve(const float lm = 0.0001, const float ep = 0.1) {
+      auto diag = H.diagonal();
+      H.diagonal().add_(ep + lm * diag);
+
+      auto result = torch::linalg_cholesky_ex(H);
+      auto L = std::get<0>(result);
+      auto info = std::get<1>(result);
+
+      torch::Tensor dx;
+      if (info.item<int>() == 0) {
+        dx = torch::cholesky_solve(b, L);
+      } else {
+        try {
+          dx = torch::linalg_solve(H, b);
+        } catch (...) {
+          dx = torch::zeros_like(b);
+        }
+      }
+      return dx.reshape({N, M});
+    }
+};
+
+
+// Build Schur complement directly into a DenseBlock on GPU
+DenseBlock dense_schur_block(torch::Tensor E,
+                             torch::Tensor Q,
+                             torch::Tensor w,
+                             torch::Tensor ii,
+                             torch::Tensor jj,
+                             torch::Tensor kk,
+                             const int t0,
+                             const int t1)
+{
+  torch::Tensor ii_cpu = ii.to(torch::kCPU);
+  torch::Tensor jj_cpu = jj.to(torch::kCPU);
+  torch::Tensor kk_cpu = kk.to(torch::kCPU);
+
+  const int P = t1 - t0;
+  const long* ii_data = ii_cpu.data_ptr<long>();
+  const long* jj_data = jj_cpu.data_ptr<long>();
+  const long* kk_data = kk_cpu.data_ptr<long>();
+
+  std::vector<std::vector<long>> graph(P);
+  std::vector<std::vector<long>> index(P);
+
+  for (int n = 0; n < ii_cpu.size(0); n++) {
+    const int j = jj_data[n];
+    const int k = kk_data[n];
+    if (j >= t0 && j <= t1) {
+      graph[j - t0].push_back(k);
+      index[j - t0].push_back(n);
+    }
+  }
+
+  std::vector<long> ii_list, jj_list, idx;
+  for (int i = 0; i < P; i++) {
+    for (int j = 0; j < P; j++) {
+      for (int k = 0; k < (int)graph[i].size(); k++) {
+        for (int l = 0; l < (int)graph[j].size(); l++) {
+          if (graph[i][k] == graph[j][l]) {
+            ii_list.push_back(i);
+            jj_list.push_back(j);
+            idx.push_back(index[i][k]);
+            idx.push_back(index[j][l]);
+            idx.push_back(graph[i][k]);
+          }
+        }
+      }
+    }
+  }
+
+  torch::Tensor ix_cuda = torch::from_blob(idx.data(), {long(idx.size())},
+    torch::TensorOptions().dtype(torch::kInt64)).to(torch::kCUDA).view({-1, 3});
+  torch::Tensor jx_cuda = torch::stack({kk_cpu}, -1)
+    .to(torch::kCUDA).to(torch::kInt64);
+
+  torch::Tensor S_blocks = torch::zeros({ix_cuda.size(0), 6, 6},
+    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+  torch::Tensor v_vec = torch::zeros({jx_cuda.size(0), 6},
+    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+
+  EEt6x6_kernel<<<ix_cuda.size(0), THREADS>>>(
+    E.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+    Q.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+    ix_cuda.packed_accessor32<long,2,torch::RestrictPtrTraits>(),
+    S_blocks.packed_accessor32<float,3,torch::RestrictPtrTraits>());
+
+  Ev6x1_kernel<<<jx_cuda.size(0), THREADS>>>(
+    E.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+    Q.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+    w.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+    jx_cuda.packed_accessor32<long,2,torch::RestrictPtrTraits>(),
+    v_vec.packed_accessor32<float,2,torch::RestrictPtrTraits>());
+
+  torch::Tensor ii2_cpu = torch::from_blob(ii_list.data(), {long(ii_list.size())},
+    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+  torch::Tensor jj2_cpu = torch::from_blob(jj_list.data(), {long(jj_list.size())},
+    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+
+  DenseBlock result(P, 6);
+  result.update_lhs(S_blocks, ii2_cpu, jj2_cpu);
+  result.update_rhs(v_vec, jj_cpu - t0);
+  return result;
+}
+
+
 class SparseBlock {
   public:
 
@@ -1860,14 +2064,14 @@ std::vector<torch::Tensor> ba_cuda(
       enable_bidirectional_uncer);
 
 
-    // pose x pose block
-    SparseBlock A(t1 - t0, 6);
+    // pose x pose block — GPU-resident dense solver
+    DenseBlock A(t1 - t0, 6);
 
-    A.update_lhs(Hs.reshape({-1, 6, 6}), 
-        torch::cat({ii, ii, jj, jj}) - t0, 
+    A.update_lhs(Hs.reshape({-1, 6, 6}),
+        torch::cat({ii, ii, jj, jj}) - t0,
         torch::cat({ii, jj, ii, jj}) - t0);
 
-    A.update_rhs(vs.reshape({-1, 6}), 
+    A.update_rhs(vs.reshape({-1, 6}),
         torch::cat({ii, jj}) - t0);
 
     if (motion_only) {
@@ -1878,7 +2082,7 @@ std::vector<torch::Tensor> ba_cuda(
         poses.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
         dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(), t0, t1);
     }
-    
+
     else {
       // add depth residual if there are depth sensor measurements
       const float alpha = gamma_depth;
@@ -1890,8 +2094,8 @@ std::vector<torch::Tensor> ba_cuda(
       torch::Tensor Ei = accum_cuda(Eii.view({num, 6*ht*wd}), ii, ts).view({t1-t0, 6, ht*wd});
       torch::Tensor E = torch::cat({Ei, Eij}, 0);
 
-      SparseBlock S = schur_block(E, Q, w, ii_exp, jj_exp, kk_exp, t0, t1);   // simulataneouly construct the lhs and rhs of the linear system
-      dx = (A - S).solve(lm, ep);     // compute delta_pose
+      DenseBlock S = dense_schur_block(E, Q, w, ii_exp, jj_exp, kk_exp, t0, t1);
+      dx = (A - S).solve(lm, ep);     // GPU-resident Cholesky solve
 
       torch::Tensor ix = jj_exp - t0;
       torch::Tensor dw = torch::zeros({ix.size(0), ht*wd}, opts);
