@@ -27,12 +27,43 @@ def get_metric_depth_estimator(cfg: Dict) -> torch.nn.Module:
     if "metric3d_vit" in depth_model:
         # Options: metric3d_vit_small, metric3d_vit_large, metric3d_vit_giant2
         model = torch.hub.load("yvanyin/metric3d", depth_model, pretrain=True)
+    elif "da3" in depth_model:
+        model = _create_da3_model(depth_model, device)
+        return model  # DA3 model is already on device and in eval mode
     elif "dpt2" in depth_model:
         model = _create_dpt2_model(depth_model)
     else:
-        # If use other metric depth estimator as prior, write the code here
-        raise NotImplementedError("Unsupported depth model")
+        raise NotImplementedError(f"Unsupported depth model: {depth_model}")
     return model.to(device).eval()
+
+
+def _create_da3_model(depth_model: str, device: str):
+    """
+    Create a Depth Anything V3 metric depth model.
+
+    Args:
+        depth_model (str): Model name (e.g., 'da3_metric_large').
+        device (str): Device to run the model on.
+
+    Returns:
+        DepthAnything3: Configured DA3 model.
+    """
+    import os
+    os.environ["DA3_LOG_LEVEL"] = "WARN"
+    from depth_anything_3.api import DepthAnything3
+
+    # Map config names to HuggingFace model IDs
+    da3_models = {
+        "da3_metric_large": "depth-anything/DA3METRIC-LARGE",
+    }
+
+    hf_id = da3_models.get(depth_model)
+    if hf_id is None:
+        raise ValueError(f"Unknown DA3 model: {depth_model}. Available: {list(da3_models.keys())}")
+
+    model = DepthAnything3.from_pretrained(hf_id)
+    model = model.to(device)
+    return model
 
 
 def _create_dpt2_model(depth_model: str) -> DepthAnythingV2:
@@ -98,6 +129,8 @@ def predict_metric_depth(
     depth_model = cfg["mono_prior"]["depth"]
     if "metric3d_vit" in depth_model:
         output = _predict_metric3d_depth(model, input_tensor, cfg, device)
+    elif "da3" in depth_model:
+        output = _predict_da3_depth(model, input_tensor, cfg, device)
     elif "dpt2" in depth_model:
         # dpt2 model takes np.uint8 as the dtype of input
         input_numpy = (255.0 * input.squeeze().permute(1, 2, 0).cpu().numpy()).astype(
@@ -106,13 +139,43 @@ def predict_metric_depth(
         depth = model.infer_image(input_numpy, input_size=518)
         output = torch.tensor(depth).to(device)
     else:
-        # If use other metric depth estimator as prior, write the code here
-        raise NotImplementedError("Unsupported depth model")
+        raise NotImplementedError(f"Unsupported depth model: {depth_model}")
 
     if save_depth:
         _save_depth_map(output, cfg, idx)
 
     return output
+
+
+def _predict_da3_depth(
+    model, input_tensor: torch.Tensor, cfg: Dict, device: str
+) -> torch.Tensor:
+    """
+    Predict metric depth using Depth Anything V3.
+    DA3 uses canonical camera model with focal=300 (vs Metric3D's 1000).
+    """
+    h, w = input_tensor.shape[-2:]
+
+    # DA3 inference() expects numpy uint8 HWC RGB
+    input_numpy = (255.0 * input_tensor.squeeze().permute(1, 2, 0).cpu().numpy()).astype(
+        np.uint8
+    )
+
+    prediction = model.inference(image=[input_numpy], process_res=504)
+    raw_depth = prediction.depth[0]  # (H_proc, W_proc), raw canonical depth
+
+    # Resize to original resolution
+    raw_depth_tensor = torch.from_numpy(raw_depth).to(device)
+    raw_depth_tensor = F.interpolate(
+        raw_depth_tensor[None, None, :, :], (h, w), mode="bicubic"
+    ).squeeze()
+
+    # Apply canonical-to-real scaling: metric_depth = raw * (focal / 300.0)
+    focal_px = (cfg["cam"]["fx"] + cfg["cam"]["fy"]) / 2.0
+    canonical_to_real_scale = focal_px / 300.0
+    pred_depth = raw_depth_tensor * canonical_to_real_scale
+
+    return torch.clamp(pred_depth, 0, 300)
 
 
 def _predict_metric3d_depth(
