@@ -154,7 +154,9 @@ mono_prior:
   # Options: 'metric3d_vit_large', 'metric3d_vit_small', 'da3_metric_large'
   depth: 'da3_metric_large'
   save_depth: False
-  feature_extractor: 'dinov2_reg_small_fine' 
+  # Options: 'dinov2_reg_small_fine', 'dinov2_vits14', 'dinov3_vits16'
+  # Note: DINOv3 requires retraining — feature norm ~8 vs DINOv2's ~16.
+  feature_extractor: 'dinov2_reg_small_fine'
   save_feature: False
 
 data:
