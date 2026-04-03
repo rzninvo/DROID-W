@@ -60,6 +60,9 @@ IGNORE_CLASSES = {
     # Body parts
     "hand", "hands", "arm", "arms", "leg", "legs", "head", "face",
     "foot", "feet", "hair", "finger", "fingers",
+    # Gendered/age variants — normalize to "person"
+    "man", "woman", "boy", "girl", "child", "kid", "baby",
+    "lady", "gentleman", "male", "female", "pedestrian",
 }
 
 # Words that indicate an attribute description, not an object
