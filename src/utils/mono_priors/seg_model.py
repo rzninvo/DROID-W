@@ -1,18 +1,16 @@
 """
-Object detection module used for both in-loop dynamic masking and
-post-processing scene graph construction.
+Object detection module for scene graph construction.
 
-In-loop usage (MotionFilter):
-    Each new keyframe is passed through YOLO-World.  Detections of dynamic
-    classes (person, car, ...) are converted to a binary mask via
-    create_dynamic_mask() and stored in DepthVideo.seg_masks.  The
-    FactorGraph multiplies BA weights by this mask so dynamic pixels
-    contribute less to pose / depth optimisation.
+Runs on DROID-W keyframes and produces per-frame detections (bounding boxes,
+labels, confidences). Static/dynamic classification is done exclusively via
+DROID-W's uncertainty map — no hardcoded class-based separation.
 
-Post-processing usage (scene graph):
-    DROID-W saves keyframes → this module reads RGB, runs YOLO-World,
-    saves detections → scene graph module combines detections + DROID-W
-    outputs.
+Data flow:
+    DROID-W saves keyframes (RGB, pose, depth, FiT3D features, uncertainty)
+    → This module detects all objects via YOLO-World
+    → classify_detections_by_uncertainty() tags each detection using the
+      uncertainty map (75th percentile inside each box)
+    → Scene graph module consumes labeled, tagged detections
 """
 
 from typing import Dict, List
@@ -139,59 +137,6 @@ def load_detections(output_dir: str, idx: int) -> List[Dict]:
     det_path = os.path.join(output_dir, "detections", f"{idx:05d}.json")
     with open(det_path) as f:
         return json.load(f)
-
-
-# Classes that represent inherently dynamic/movable objects.
-DYNAMIC_CLASSES = {
-    "person",
-    "car", "bus", "truck", "motorcycle", "bicycle", "scooter",
-    "van", "taxi", "ambulance", "train",
-    "dog", "cat", "bird", "horse", "cow", "sheep",
-    "skateboard", "stroller", "wheelchair", "shopping cart",
-}
-
-
-def create_dynamic_mask(
-    detections: List[Dict],
-    height: int,
-    width: int,
-    dynamic_classes: set = None,
-) -> np.ndarray:
-    """
-    Build a per-pixel static/dynamic mask from bounding-box detections.
-
-    Args:
-        detections: Output of detect_objects().
-        height: Mask height (typically H/8 for BA resolution).
-        width: Mask width  (typically W/8 for BA resolution).
-        dynamic_classes: Set of class names considered dynamic.
-                         Defaults to DYNAMIC_CLASSES.
-
-    Returns:
-        float32 numpy array of shape (height, width).
-        1.0 = static, 0.0 = dynamic.
-    """
-    if dynamic_classes is None:
-        dynamic_classes = DYNAMIC_CLASSES
-
-    mask = np.ones((height, width), dtype=np.float32)
-
-    for det in detections:
-        if det["label"] not in dynamic_classes:
-            continue
-        x1, y1, x2, y2 = det["box"]
-        img_h, img_w = det["img_h"], det["img_w"]
-
-        # Scale box to mask resolution
-        bx1 = max(0, int(x1 * width / img_w))
-        by1 = max(0, int(y1 * height / img_h))
-        bx2 = min(width, int(x2 * width / img_w))
-        by2 = min(height, int(y2 * height / img_h))
-
-        if bx2 > bx1 and by2 > by1:
-            mask[by1:by2, bx1:bx2] = 0.0
-
-    return mask
 
 
 def classify_detections_by_uncertainty(
