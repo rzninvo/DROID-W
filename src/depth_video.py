@@ -810,15 +810,23 @@ class DepthVideo:
         droid_disps = self.disps[:self.counter.value].cpu().numpy()
         intrinsics = self.intrinsics[:self.counter.value].cpu().numpy()
         uncertainties = self.uncertainties[:self.counter.value].cpu().numpy()
-        np.savez(path,
+
+        save_dict = dict(
             timestamps=timestamps,
             images=images,
-            poses=poses,tum_poses=tum_poses,
+            poses=poses, tum_poses=tum_poses,
             mono_disps=mono_disps,
             droid_disps_up=droid_disps_up,
             droid_disps=droid_disps,
             intrinsics=intrinsics,
-            uncertainties=uncertainties)
+            uncertainties=uncertainties,
+        )
+
+        # Save DINO/FiT3D features for post-processing (ReID, scene graphs)
+        if self.dino_feats is not None:
+            save_dict["dino_feats"] = self.dino_feats[:self.counter.value].cpu().numpy()
+
+        np.savez(path, **save_dict)
         self.printer.print(f"Saved final depth video: {path}",FontColor.INFO)
 
     def save_poses(self,path:str):

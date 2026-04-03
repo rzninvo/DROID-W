@@ -271,6 +271,160 @@ def load_tracks(output_dir: str) -> Dict[int, Dict]:
         return {int(k): v for k, v in json.load(f).items()}
 
 
+def pool_features_in_box(
+    dino_feats: np.ndarray,
+    box: List[float],
+    img_h: int,
+    img_w: int,
+) -> np.ndarray:
+    """
+    Average-pool DINO/FiT3D features inside a bounding box.
+
+    Args:
+        dino_feats: Feature map of shape (fh, fw, C) where fh = H//14, fw = W//14.
+        box: [x1, y1, x2, y2] in image pixel coordinates.
+        img_h: Image height the box was detected in.
+        img_w: Image width the box was detected in.
+
+    Returns:
+        1D feature vector of shape (C,), L2-normalized. Returns zeros if box
+        maps to empty region.
+    """
+    fh, fw, C = dino_feats.shape
+    x1, y1, x2, y2 = box
+
+    # Scale box to feature map resolution
+    fx1 = max(0, int(x1 * fw / img_w))
+    fy1 = max(0, int(y1 * fh / img_h))
+    fx2 = min(fw, int(x2 * fw / img_w))
+    fy2 = min(fh, int(y2 * fh / img_h))
+
+    if fx2 <= fx1 or fy2 <= fy1:
+        return np.zeros(C, dtype=np.float32)
+
+    region = dino_feats[fy1:fy2, fx1:fx2, :]  # (rh, rw, C)
+    embedding = region.reshape(-1, C).mean(axis=0)  # (C,)
+
+    # L2 normalize
+    norm = np.linalg.norm(embedding)
+    if norm > 1e-6:
+        embedding = embedding / norm
+
+    return embedding
+
+
+def merge_fragmented_tracks(
+    tracks: Dict[int, Dict],
+    all_detections: List[List[Dict]],
+    dino_feats_all: np.ndarray,
+    images_shape: tuple,
+    cosine_thresh: float = 0.7,
+    max_gap: int = 30,
+) -> tuple:
+    """
+    Merge fragmented tracks using FiT3D/DINO feature similarity.
+
+    When BoT-SORT loses an object and re-detects it with a new ID, this
+    function finds those fragments and unifies them under one ID.
+
+    Args:
+        tracks: Output of build_object_tracks().
+        all_detections: Per-frame detection lists from track_objects().
+        dino_feats_all: DINO features array of shape (N_keyframes, fh, fw, C).
+        images_shape: (N, C, H, W) — needed to know image dimensions.
+        cosine_thresh: Minimum cosine similarity to merge two tracks.
+        max_gap: Maximum keyframe gap between tracks to consider merging.
+
+    Returns:
+        (merged_tracks, merged_detections) with reassigned track_ids.
+    """
+    if dino_feats_all is None or len(tracks) < 2:
+        return tracks, all_detections
+
+    _, _, img_h, img_w = images_shape
+
+    # Step 1: Compute per-track embedding by averaging pooled features
+    track_embeddings = {}
+    for tid, t in tracks.items():
+        embeddings = []
+        for frame_idx, box in t["boxes"]:
+            if frame_idx < len(dino_feats_all):
+                feat = dino_feats_all[frame_idx]  # (fh, fw, C)
+                emb = pool_features_in_box(feat, box, img_h, img_w)
+                if np.linalg.norm(emb) > 1e-6:
+                    embeddings.append(emb)
+        if embeddings:
+            avg = np.mean(embeddings, axis=0)
+            norm = np.linalg.norm(avg)
+            track_embeddings[tid] = avg / norm if norm > 1e-6 else avg
+        else:
+            track_embeddings[tid] = None
+
+    # Step 2: Find merge candidates — same label, non-overlapping time, similar features
+    merge_map = {}  # old_tid → new_tid
+    tids = sorted(tracks.keys())
+
+    for i, tid_a in enumerate(tids):
+        if tid_a in merge_map:
+            continue
+        ta = tracks[tid_a]
+        emb_a = track_embeddings.get(tid_a)
+        if emb_a is None:
+            continue
+
+        for tid_b in tids[i + 1:]:
+            if tid_b in merge_map:
+                continue
+            tb = tracks[tid_b]
+            emb_b = track_embeddings.get(tid_b)
+            if emb_b is None:
+                continue
+
+            # Must have same label
+            if ta["label"] != tb["label"]:
+                continue
+
+            # Must not overlap in time (allow small overlap of 1 frame)
+            if ta["last_seen"] >= tb["first_seen"] - 1 and tb["last_seen"] >= ta["first_seen"] - 1:
+                # Check if they truly overlap (both active at the same frame)
+                a_frames = {f for f, _ in ta["boxes"]}
+                b_frames = {f for f, _ in tb["boxes"]}
+                if a_frames & b_frames:
+                    continue
+
+            # Gap between tracks must be reasonable
+            gap = min(
+                abs(tb["first_seen"] - ta["last_seen"]),
+                abs(ta["first_seen"] - tb["last_seen"]),
+            )
+            if gap > max_gap:
+                continue
+
+            # Cosine similarity check
+            sim = float(np.dot(emb_a, emb_b))
+            if sim >= cosine_thresh:
+                merge_map[tid_b] = tid_a
+
+    if not merge_map:
+        return tracks, all_detections
+
+    # Step 3: Reassign track_ids in all detections
+    merged_detections = []
+    for frame_dets in all_detections:
+        new_frame = []
+        for det in frame_dets:
+            det = dict(det)  # copy
+            tid = det.get("track_id", -1)
+            det["track_id"] = merge_map.get(tid, tid)
+            new_frame.append(det)
+        merged_detections.append(new_frame)
+
+    # Step 4: Rebuild tracks from merged detections
+    merged_tracks = build_object_tracks(merged_detections)
+
+    return merged_tracks, merged_detections
+
+
 def classify_detections_by_uncertainty(
     detections: List[Dict],
     uncertainty_map: torch.Tensor,
