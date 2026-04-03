@@ -46,12 +46,21 @@ logger = logging.getLogger(__name__)
 # Fallback classes if VLM fails or is disabled — minimal seed list
 SEED_CLASSES = ["person", "car", "chair", "table", "door"]
 
+# Surface/background classes to filter out — not useful as scene graph objects
+IGNORE_CLASSES = {
+    "floor", "ceiling", "wall", "ground", "sky", "background",
+    "shadow", "light", "air", "space", "none", "nothing",
+}
+
 # VLM prompt for object discovery
 DISCOVERY_PROMPT = (
-    "List every distinct object type visible in this image. "
-    "Use common, short nouns (e.g. 'person', 'car', 'umbrella', 'bench'). "
-    "Return ONLY a comma-separated list, nothing else. "
-    "Be exhaustive — include small and background objects."
+    "List every distinct object you can see in this image. "
+    "Include large objects (furniture, vehicles, walls) AND small objects "
+    "(door handles, mugs, switches, books, bottles, pens, cables). "
+    "Include structural elements (door, window, shelf, radiator, vent). "
+    "Include things on surfaces (monitor, keyboard, plant, photo frame). "
+    "Use common, short nouns. Be extremely thorough — list even partially visible objects. "
+    "Return ONLY a comma-separated list, nothing else."
 )
 
 
@@ -223,6 +232,8 @@ class VLMSceneScout:
         new_classes = []
         with self._lock:
             for cls in discovered:
+                if cls in IGNORE_CLASSES:
+                    continue
                 if cls not in self._classes and len(self._classes) < self.max_classes:
                     self._classes.add(cls)
                     new_classes.append(cls)
