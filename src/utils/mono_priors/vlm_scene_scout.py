@@ -46,10 +46,29 @@ logger = logging.getLogger(__name__)
 # Fallback classes if VLM fails or is disabled — minimal seed list
 SEED_CLASSES = ["person", "car", "chair", "table", "door"]
 
-# Surface/background classes to filter out — not useful as scene graph objects
+# Classes to filter out — backgrounds, clothing, body parts, colors, materials
 IGNORE_CLASSES = {
+    # Background/surfaces
     "floor", "ceiling", "wall", "ground", "sky", "background",
-    "shadow", "light", "air", "space", "none", "nothing",
+    "shadow", "light", "air", "space", "none", "nothing", "road",
+    "sidewalk", "pavement", "grass", "dirt", "concrete", "asphalt",
+    # Clothing (competes with "person" in YOLO-World)
+    "shirt", "tshirt", "t-shirt", "jacket", "coat", "pants", "jeans",
+    "shorts", "dress", "skirt", "hat", "cap", "helmet", "shoe", "shoes",
+    "boot", "boots", "sneakers", "hoodie", "sweater", "vest", "scarf",
+    "glove", "gloves", "sock", "socks", "mask", "glasses", "sunglasses",
+    # Body parts
+    "hand", "hands", "arm", "arms", "leg", "legs", "head", "face",
+    "foot", "feet", "hair", "finger", "fingers",
+}
+
+# Words that indicate an attribute description, not an object
+ATTRIBUTE_WORDS = {
+    "red", "blue", "green", "yellow", "white", "black", "brown", "gray",
+    "grey", "pink", "orange", "purple", "dark", "light", "bright",
+    "large", "small", "big", "tall", "short", "long", "old", "new",
+    "left", "right", "front", "back", "top", "bottom", "wooden", "metal",
+    "plastic", "striped", "colored", "coloured",
 }
 
 # VLM prompt for object discovery
@@ -140,7 +159,8 @@ def parse_vlm_response(response: str) -> List[str]:
     Parse VLM comma-separated response into clean class names.
 
     Handles common VLM quirks: numbered lists, bullet points, extra whitespace,
-    quotes, periods, and mixed formatting.
+    quotes, periods, and mixed formatting. Strips color/size adjectives so
+    "blue tshirt" becomes "tshirt" (which then gets filtered by IGNORE_CLASSES).
 
     Args:
         response: Raw text from VLM.
@@ -148,7 +168,6 @@ def parse_vlm_response(response: str) -> List[str]:
     Returns:
         List of cleaned, lowercase class names.
     """
-    # Remove common list formatting
     import re
 
     # Handle numbered lists: "1. person, 2. car" or "1) person"
@@ -165,8 +184,26 @@ def parse_vlm_response(response: str) -> List[str]:
     for part in parts:
         name = part.strip().lower().rstrip('.')
         # Skip empty or overly long entries (VLM hallucination)
-        if name and len(name) < 40 and len(name) > 1:
-            classes.append(name)
+        if not name or len(name) >= 40 or len(name) <= 1:
+            continue
+
+        # Strip attribute words (e.g., "blue tshirt" → "tshirt")
+        words = name.split()
+        words = [w for w in words if w not in ATTRIBUTE_WORDS]
+        name = " ".join(words).strip()
+
+        if not name:
+            continue
+
+        # Skip if the cleaned name is in IGNORE_CLASSES
+        if name in IGNORE_CLASSES:
+            continue
+
+        # Skip if any word in the name is clothing/body part
+        if any(w in IGNORE_CLASSES for w in name.split()):
+            continue
+
+        classes.append(name)
 
     return classes
 
