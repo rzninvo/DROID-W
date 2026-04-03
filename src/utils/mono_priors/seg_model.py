@@ -1,25 +1,24 @@
 """
-Object detection module for scene graph construction.
+Object detection and tracking module for scene graph construction.
 
-Runs on DROID-W keyframes and produces per-frame detections (bounding boxes,
-labels, confidences). Static/dynamic classification is done exclusively via
-DROID-W's uncertainty map — no hardcoded class-based separation.
+Runs on DROID-W keyframes and produces per-frame detections with persistent
+object IDs across frames. Static/dynamic classification is done exclusively
+via DROID-W's uncertainty map — no hardcoded class-based separation.
 
 Data flow:
     DROID-W saves keyframes (RGB, pose, depth, FiT3D features, uncertainty)
-    → This module detects all objects via YOLO-World
+    → This module detects and tracks all objects via YOLO-World + BoT-SORT
     → classify_detections_by_uncertainty() tags each detection using the
       uncertainty map (75th percentile inside each box)
-    → Scene graph module consumes labeled, tagged detections
+    → Scene graph module consumes labeled, tracked, tagged detections
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 import os
 import json
 
 import numpy as np
 import torch
-
 
 
 # Comprehensive prompt list for YOLO-World open-vocabulary detection.
@@ -83,7 +82,7 @@ def detect_objects(
     conf_thresh: float = 0.15,
 ) -> List[Dict]:
     """
-    Run open-vocabulary detection on a single frame.
+    Run open-vocabulary detection on a single frame (no tracking).
 
     Args:
         model: YOLO-World model from get_detector().
@@ -92,12 +91,7 @@ def detect_objects(
 
     Returns:
         List of detections, each a dict with:
-            box: [x1, y1, x2, y2] in pixel coords
-            label: str class name
-            confidence: float
-            class_id: int (model-internal, not COCO)
-            img_h: int
-            img_w: int
+            box, label, confidence, class_id, img_h, img_w
     """
     H, W = image_np.shape[:2]
     results = model.predict(image_np, conf=conf_thresh, verbose=False)
@@ -124,6 +118,131 @@ def detect_objects(
     return detections
 
 
+@torch.no_grad()
+def track_objects(
+    model,
+    image_np: np.ndarray,
+    frame_idx: int,
+    conf_thresh: float = 0.15,
+    tracker: str = "botsort.yaml",
+) -> List[Dict]:
+    """
+    Run open-vocabulary detection with persistent object tracking.
+
+    Uses BoT-SORT (default) or ByteTrack to maintain consistent object IDs
+    across sequential frames. Must be called on frames in order — the tracker
+    maintains internal state between calls via persist=True.
+
+    Note: DROID-W keyframes are not consecutive video frames (gaps of 5-30
+    frames due to motion-based keyframe selection). BoT-SORT handles this
+    reasonably well due to its re-identification features, but expect some
+    ID switches on objects that move significantly between keyframes.
+
+    Args:
+        model: YOLO-World model from get_detector().
+        image_np: uint8 numpy array (H, W, 3) in RGB.
+        frame_idx: Keyframe index (used for first_seen/last_seen metadata).
+        conf_thresh: Minimum detection confidence.
+        tracker: Tracker config ("botsort.yaml" or "bytetrack.yaml").
+
+    Returns:
+        List of detections, each a dict with:
+            box: [x1, y1, x2, y2] in pixel coords
+            label: str class name
+            confidence: float
+            class_id: int (model-internal)
+            track_id: int — persistent ID across frames (-1 if tracking lost)
+            frame_idx: int — which keyframe this detection is from
+            img_h: int
+            img_w: int
+    """
+    H, W = image_np.shape[:2]
+    results = model.track(image_np, conf=conf_thresh, persist=True, tracker=tracker, verbose=False)
+
+    detections = []
+    if results and len(results) > 0:
+        result = results[0]
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+
+            # track IDs may not exist if tracker loses the object
+            if result.boxes.id is not None:
+                track_ids = result.boxes.id.cpu().numpy().astype(int)
+            else:
+                track_ids = np.full(len(classes), -1, dtype=int)
+
+            for i in range(len(classes)):
+                label = result.names.get(classes[i], str(classes[i])) if result.names else str(classes[i])
+                detections.append({
+                    "box": boxes[i].tolist(),
+                    "label": label,
+                    "confidence": float(confs[i]),
+                    "class_id": int(classes[i]),
+                    "track_id": int(track_ids[i]),
+                    "frame_idx": frame_idx,
+                    "img_h": H,
+                    "img_w": W,
+                })
+
+    return detections
+
+
+def build_object_tracks(all_detections: List[List[Dict]]) -> Dict[int, Dict]:
+    """
+    Aggregate per-frame tracked detections into object-level summaries.
+
+    Args:
+        all_detections: List of per-frame detection lists from track_objects().
+
+    Returns:
+        Dict mapping track_id → object summary:
+            track_id: int
+            label: str (most frequent label for this track)
+            first_seen: int (first keyframe index)
+            last_seen: int (last keyframe index)
+            num_frames: int (how many keyframes this object appears in)
+            boxes: list of [frame_idx, [x1,y1,x2,y2]] pairs (trajectory)
+            mean_confidence: float
+    """
+    tracks = {}
+
+    for frame_dets in all_detections:
+        for det in frame_dets:
+            tid = det.get("track_id", -1)
+            if tid < 0:
+                continue
+
+            if tid not in tracks:
+                tracks[tid] = {
+                    "track_id": tid,
+                    "labels": [],
+                    "first_seen": det["frame_idx"],
+                    "last_seen": det["frame_idx"],
+                    "num_frames": 0,
+                    "boxes": [],
+                    "confidences": [],
+                }
+
+            t = tracks[tid]
+            t["labels"].append(det["label"])
+            t["last_seen"] = max(t["last_seen"], det["frame_idx"])
+            t["first_seen"] = min(t["first_seen"], det["frame_idx"])
+            t["num_frames"] += 1
+            t["boxes"].append([det["frame_idx"], det["box"]])
+            t["confidences"].append(det["confidence"])
+
+    # Finalize: pick most frequent label, compute mean confidence
+    for tid, t in tracks.items():
+        from collections import Counter
+        t["label"] = Counter(t["labels"]).most_common(1)[0][0]
+        t["mean_confidence"] = float(np.mean(t["confidences"]))
+        del t["labels"], t["confidences"]
+
+    return tracks
+
+
 def save_detections(detections: List[Dict], output_dir: str, idx: int):
     """Save detections to JSON for scene graph construction."""
     det_dir = os.path.join(output_dir, "detections")
@@ -137,6 +256,19 @@ def load_detections(output_dir: str, idx: int) -> List[Dict]:
     det_path = os.path.join(output_dir, "detections", f"{idx:05d}.json")
     with open(det_path) as f:
         return json.load(f)
+
+
+def save_tracks(tracks: Dict[int, Dict], output_dir: str):
+    """Save object tracks summary to JSON."""
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "tracks.json"), "w") as f:
+        json.dump(tracks, f, indent=2)
+
+
+def load_tracks(output_dir: str) -> Dict[int, Dict]:
+    """Load object tracks summary from JSON."""
+    with open(os.path.join(output_dir, "tracks.json")) as f:
+        return {int(k): v for k, v in json.load(f).items()}
 
 
 def classify_detections_by_uncertainty(
@@ -154,7 +286,7 @@ def classify_detections_by_uncertainty(
     negatives on genuinely dynamic objects.
 
     Args:
-        detections: List of detection dicts from detect_objects().
+        detections: List of detection dicts from detect_objects() or track_objects().
         uncertainty_map: DROID-W uncertainty tensor at any resolution.
         threshold: Percentile value above this → dynamic.
         percentile: Which percentile to use (default 75th).
@@ -184,3 +316,50 @@ def classify_detections_by_uncertainty(
         det["is_dynamic"] = score > threshold
 
     return detections
+
+
+def classify_tracks_by_uncertainty(
+    tracks: Dict[int, Dict],
+    all_detections: List[List[Dict]],
+) -> Dict[int, Dict]:
+    """
+    Aggregate per-frame is_dynamic tags into a track-level classification.
+
+    An object is considered dynamic if it was tagged dynamic in >50% of its
+    frames. This smooths out per-frame noise from the uncertainty map.
+
+    Args:
+        tracks: Output of build_object_tracks().
+        all_detections: Per-frame detections (must already have is_dynamic from
+                        classify_detections_by_uncertainty).
+
+    Returns:
+        Same tracks dict with added 'is_dynamic', 'dynamic_ratio', and
+        'mean_dynamic_confidence' fields.
+    """
+    # Collect per-track dynamic stats
+    track_stats = {}
+    for frame_dets in all_detections:
+        for det in frame_dets:
+            tid = det.get("track_id", -1)
+            if tid < 0 or "is_dynamic" not in det:
+                continue
+            if tid not in track_stats:
+                track_stats[tid] = {"dynamic_count": 0, "total": 0, "scores": []}
+            track_stats[tid]["total"] += 1
+            track_stats[tid]["scores"].append(det.get("dynamic_confidence", 0.0))
+            if det["is_dynamic"]:
+                track_stats[tid]["dynamic_count"] += 1
+
+    for tid, t in tracks.items():
+        if tid in track_stats:
+            stats = track_stats[tid]
+            t["dynamic_ratio"] = stats["dynamic_count"] / max(1, stats["total"])
+            t["mean_dynamic_confidence"] = float(np.mean(stats["scores"]))
+            t["is_dynamic"] = t["dynamic_ratio"] > 0.5
+        else:
+            t["dynamic_ratio"] = 0.0
+            t["mean_dynamic_confidence"] = 0.0
+            t["is_dynamic"] = False
+
+    return tracks
