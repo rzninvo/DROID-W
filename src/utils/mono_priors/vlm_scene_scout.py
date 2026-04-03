@@ -189,11 +189,14 @@ class VLMSceneScout:
         self.enabled = vlm_cfg.get("activate", False)
         self.max_classes = vlm_cfg.get("max_classes", 200)
 
-        # Thread-safe class storage
+        # Thread-safe class storage — seeded with DEFAULT_CLASSES so common
+        # objects (person, car, chair, etc.) are always detected even if
+        # the VLM misses them. VLM adds scene-specific classes on top.
+        from src.utils.mono_priors.seg_model import DEFAULT_CLASSES
         self._lock = threading.Lock()
-        self._classes: Set[str] = set()
-        self._classes_changed = False
-        self._class_list_version = 0
+        self._classes: Set[str] = {c.lower() for c in DEFAULT_CLASSES}
+        self._classes_changed = True
+        self._class_list_version = 1
 
         # Background processing
         self._queue: queue.Queue = queue.Queue(maxsize=5)
