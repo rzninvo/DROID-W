@@ -130,7 +130,7 @@ def detect_objects(
             box, label, confidence, class_id, img_h, img_w
     """
     H, W = image_np.shape[:2]
-    results = model.predict(image_np, conf=conf_thresh, verbose=False)
+    results = model.predict(image_np, conf=conf_thresh, imgsz=1280, verbose=False)
 
     detections = []
     if results and len(results) > 0:
@@ -193,7 +193,7 @@ def track_objects(
             img_w: int
     """
     H, W = image_np.shape[:2]
-    results = model.track(image_np, conf=conf_thresh, persist=True, tracker=tracker, verbose=False)
+    results = model.track(image_np, conf=conf_thresh, imgsz=1280, persist=True, tracker=tracker, verbose=False)
 
     detections = []
     if results and len(results) > 0:
@@ -461,6 +461,32 @@ def merge_fragmented_tracks(
     return merged_tracks, merged_detections
 
 
+def compute_adaptive_threshold(
+    all_uncertainties: np.ndarray,
+    k: float = 1.5,
+) -> float:
+    """
+    Compute a scene-adaptive threshold for static/dynamic classification.
+
+    Uses the median + k * MAD (median absolute deviation) of the global
+    uncertainty distribution. This adapts to scenes with different overall
+    uncertainty levels — a quiet indoor scene gets a lower threshold than
+    a busy street scene.
+
+    Args:
+        all_uncertainties: Uncertainty maps, shape (N, h, w).
+        k: Multiplier for MAD. Higher = fewer false dynamic. Default 1.5.
+
+    Returns:
+        Adaptive threshold value.
+    """
+    flat = all_uncertainties.flatten()
+    median = np.median(flat)
+    mad = np.median(np.abs(flat - median))
+    threshold = median + k * mad
+    return float(threshold)
+
+
 def classify_detections_by_uncertainty(
     detections: List[Dict],
     uncertainty_map: torch.Tensor,
@@ -478,7 +504,8 @@ def classify_detections_by_uncertainty(
     Args:
         detections: List of detection dicts from detect_objects() or track_objects().
         uncertainty_map: DROID-W uncertainty tensor at any resolution.
-        threshold: Percentile value above this → dynamic.
+        threshold: Percentile value above this → dynamic. Use
+                   compute_adaptive_threshold() for scene-adaptive values.
         percentile: Which percentile to use (default 75th).
 
     Returns:
