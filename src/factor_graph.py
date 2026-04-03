@@ -213,6 +213,9 @@ class FactorGraph:
                 self.video.dino_feats[ix] = self.video.dino_feats[ix+1]
                 self.video.uncertainties[ix] = self.video.uncertainties[ix+1]
 
+            if self.video.use_segmentation:
+                self.video.seg_masks[ix] = self.video.seg_masks[ix+1]
+
         m = (self.ii_inac == ix) | (self.jj_inac == ix)
         self.ii_inac[self.ii_inac >= ix] -= 1       # kfs after ix: index - 1
         self.jj_inac[self.jj_inac >= ix] -= 1
@@ -269,8 +272,13 @@ class FactorGraph:
 
             damping = .2 * self.damping[torch.unique(ii)].contiguous() + EP     # damping factor: avoid singlevalue tensor
 
+            # downweight dynamic regions using segmentation masks
+            if self.video.use_segmentation:
+                seg_w = self.video.seg_masks[ii]          # [N_edges, ht, wd]
+                weight = weight * seg_w[None, :, :, :, None]  # [1, N, ht, wd, 2]
+
             # bundle adjustment
-            self.video.ba(target, weight, damping, ii, jj, t0, t1, 
+            self.video.ba(target, weight, damping, ii, jj, t0, t1,
                 iters=itrs, lm=1e-4, ep=0.1, lr=self.video.cfg['tracking']['uncertainty_params']['lr'], 
                 weight_decay=self.video.cfg['tracking']['uncertainty_params']['weight_decay'],
                 motion_only=motion_only, 
@@ -326,8 +334,13 @@ class FactorGraph:
             target = self.target
             weight = self.weight
 
-            # dense bundle adjustment            
-            self.video.ba(target, weight, damping, self.ii, self.jj, t0, t1, 
+            # downweight dynamic regions using segmentation masks
+            if self.video.use_segmentation:
+                seg_w = self.video.seg_masks[self.ii]          # [N_edges, ht, wd]
+                weight = weight * seg_w[None, :, :, :, None]  # [1, N, ht, wd, 2]
+
+            # dense bundle adjustment
+            self.video.ba(target, weight, damping, self.ii, self.jj, t0, t1,
                 iters=itrs, lm=1e-5, ep=1e-2, lr=self.video.cfg['tracking']['uncertainty_params']['gba_lr'],
                 weight_decay=self.video.cfg['tracking']['uncertainty_params']['gba_weight_decay'],
                 motion_only=False, 

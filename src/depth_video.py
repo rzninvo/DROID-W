@@ -69,6 +69,11 @@ class DepthVideo:
         self.nets = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
         self.inps = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
 
+        ### segmentation masks: 1.0 = static, 0.0 = dynamic ###
+        seg_cfg = cfg.get('mono_prior', {}).get('segmentation', {})
+        self.use_segmentation = seg_cfg.get('activate', False)
+        self.seg_masks = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+
         # initialize poses to identity transformation
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
         self.debug = cfg['debug']

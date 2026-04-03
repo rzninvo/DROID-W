@@ -161,6 +161,21 @@ mono_prior:
   # Post-processing detector for scene graphs (runs outside SLAM loop)
   detector: 'yolov8s-worldv2.pt'
   detector_conf: 0.15
+  # Segmentation-based dynamic masking (runs inside SLAM tracking loop)
+  segmentation:
+    activate: True
+    conf_thresh: 0.15
+    dynamic_classes:
+      - "person"
+      - "car"
+      - "bus"
+      - "truck"
+      - "motorcycle"
+      - "bicycle"
+      - "scooter"
+      - "dog"
+      - "cat"
+      - "bird"
 
 data:
   output: ./output/wildgs_slam
