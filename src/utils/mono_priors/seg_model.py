@@ -197,18 +197,22 @@ def create_dynamic_mask(
 def classify_detections_by_uncertainty(
     detections: List[Dict],
     uncertainty_map: torch.Tensor,
-    threshold: float = 0.8,
+    threshold: float = 0.6,
+    percentile: float = 75.0,
 ) -> List[Dict]:
     """
     Tag each detection as static or dynamic using DROID-W's uncertainty map.
 
-    For each detection box, computes mean uncertainty of pixels inside.
-    High mean uncertainty → dynamic. Low → static.
+    Uses the Nth percentile of uncertainty inside each box rather than the
+    mean.  This is robust to bounding boxes that include background pixels
+    (low uncertainty) which would dilute a simple mean and cause false
+    negatives on genuinely dynamic objects.
 
     Args:
         detections: List of detection dicts from detect_objects().
         uncertainty_map: DROID-W uncertainty tensor at any resolution.
-        threshold: Mean uncertainty above this → dynamic.
+        threshold: Percentile value above this → dynamic.
+        percentile: Which percentile to use (default 75th).
 
     Returns:
         Same detections with added 'is_dynamic' and 'dynamic_confidence' fields.
@@ -226,12 +230,12 @@ def classify_detections_by_uncertainty(
         by2 = min(u_h, int(y2 * u_h / img_h))
 
         if bx2 > bx1 and by2 > by1:
-            region = uncertainty_map[by1:by2, bx1:bx2]
-            mean_uncer = region.mean().item()
+            region = uncertainty_map[by1:by2, bx1:bx2].flatten()
+            score = torch.quantile(region.float(), percentile / 100.0).item()
         else:
-            mean_uncer = 0.0
+            score = 0.0
 
-        det["dynamic_confidence"] = mean_uncer
-        det["is_dynamic"] = mean_uncer > threshold
+        det["dynamic_confidence"] = score
+        det["is_dynamic"] = score > threshold
 
     return detections
