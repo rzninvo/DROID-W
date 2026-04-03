@@ -40,19 +40,6 @@ class MotionFilter:
         # Separate CUDA stream for mono prior inference (depth + DINO)
         self.depth_stream = torch.cuda.Stream(device=device)
 
-        # Segmentation for dynamic object masking
-        seg_cfg = cfg.get('mono_prior', {}).get('segmentation', {})
-        self.use_segmentation = seg_cfg.get('activate', False)
-        if self.use_segmentation:
-            from src.utils.mono_priors.seg_model import get_detector, DYNAMIC_CLASSES
-            dynamic_classes = seg_cfg.get('dynamic_classes', list(DYNAMIC_CLASSES))
-            self.seg_detector = get_detector(
-                model_name=cfg['mono_prior'].get('detector', 'yolov8s-worldv2.pt'),
-                classes=dynamic_classes,
-                device=device,
-            )
-            self.seg_dynamic_classes = set(dynamic_classes)
-            self.seg_conf_thresh = seg_cfg.get('conf_thresh', 0.15)
 
     @torch.amp.autocast('cuda',enabled=True)
     def __context_encoder(self, image):
@@ -100,8 +87,6 @@ class MotionFilter:
                 if self.cfg['mapping']["uncertainty_params"]['activate']:
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
-            if self.use_segmentation:
-                self._update_seg_mask(self.video.counter.value - 1, image)
         ### only add new frame if there is enough motion ###
         else:
             # index correlation volume
@@ -137,31 +122,10 @@ class MotionFilter:
                 # add new frame to video, all params
                 self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
-                if self.use_segmentation:
-                    self._update_seg_mask(self.video.counter.value - 1, image)
             else:
                 self.count += 1
 
         return force_to_add_keyframe
-
-    @torch.no_grad()
-    def _update_seg_mask(self, idx, image_tensor):
-        """Run YOLO-World and write a static/dynamic mask into video.seg_masks."""
-        from src.utils.mono_priors.seg_model import detect_objects, create_dynamic_mask
-
-        # image_tensor is [C, H, W] float in [0, 1] RGB  (or [1, C, H, W])
-        img = image_tensor
-        if img.dim() == 4:
-            img = img[0]
-        # Convert to uint8 HWC numpy for YOLO
-        image_np = (img.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-        detections = detect_objects(self.seg_detector, image_np, conf_thresh=self.seg_conf_thresh)
-
-        ht = self.video.ht // self.video.down_scale
-        wd = self.video.wd // self.video.down_scale
-        mask_np = create_dynamic_mask(detections, ht, wd, self.seg_dynamic_classes)
-        self.video.seg_masks[idx] = torch.from_numpy(mask_np).to(self.device)
 
     @torch.no_grad()
     def get_img_feature(self, tstamp, image, suffix=''):
