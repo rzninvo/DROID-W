@@ -51,14 +51,25 @@ DEFAULT_CLASSES = [
 ]
 
 
-def get_detector(model_name: str = "yolov8s-worldv2.pt", classes: List[str] = None, device: str = "cuda:0"):
+def get_detector(
+    model_name: str = "yolov8s-worldv2.pt",
+    classes: List[str] = None,
+    device: str = "cuda:0",
+    output_dir: str = None,
+):
     """
     Load YOLO-World detection model and set vocabulary.
 
+    Class priority:
+        1. Explicit `classes` argument (if provided)
+        2. VLM-discovered classes from `output_dir/vlm_classes.json` (if exists)
+        3. DEFAULT_CLASSES fallback (only when VLM is not used)
+
     Args:
         model_name: Ultralytics model name (auto-downloads weights).
-        classes: Text class list for open-vocab detection. Defaults to DEFAULT_CLASSES.
+        classes: Text class list for open-vocab detection.
         device: Device string.
+        output_dir: SLAM output directory — checked for VLM-discovered classes.
 
     Returns:
         Loaded YOLO model with vocabulary set.
@@ -68,11 +79,36 @@ def get_detector(model_name: str = "yolov8s-worldv2.pt", classes: List[str] = No
     model = YOLO(model_name)
     model.to(device)
 
-    classes = classes or DEFAULT_CLASSES
-    if isinstance(classes, list) and len(classes) > 0 and isinstance(classes[0], str):
+    # Resolve class list: explicit > VLM-discovered > fallback
+    if classes is None and output_dir is not None:
+        from src.utils.mono_priors.vlm_scene_scout import VLMSceneScout
+        vlm_classes = VLMSceneScout.load_classes(output_dir)
+        if vlm_classes is not None:
+            classes = vlm_classes
+
+    if classes is None:
+        classes = DEFAULT_CLASSES
+
+    if isinstance(classes, list) and len(classes) > 0:
         model.set_classes(classes)
 
     return model
+
+
+def update_detector_classes(model, classes: List[str]):
+    """
+    Update YOLO-World vocabulary with a new class list.
+
+    Called when the VLM scene scout discovers new object types. Re-encodes
+    text prompts into CLIP embeddings (~50ms), so only call when the list
+    actually changes.
+
+    Args:
+        model: YOLO-World model from get_detector().
+        classes: Updated text class list.
+    """
+    if isinstance(classes, list) and len(classes) > 0:
+        model.set_classes(classes)
 
 
 @torch.no_grad()

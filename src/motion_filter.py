@@ -7,6 +7,7 @@ from src.modules.droid_net import CorrBlock
 from src.utils.mono_priors.metric_depth_estimators import get_metric_depth_estimator, predict_metric_depth
 from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
+from src.utils.mono_priors.vlm_scene_scout import VLMSceneScout
 
 class MotionFilter:
     """ This class is used to filter incoming frames and extract features
@@ -39,6 +40,11 @@ class MotionFilter:
 
         # Separate CUDA stream for mono prior inference (depth + DINO)
         self.depth_stream = torch.cuda.Stream(device=device)
+
+        # VLM scene scout for open-vocab class discovery (async, non-blocking)
+        vlm_device = cfg.get('vlm_scout', {}).get('device', device)
+        self.vlm_scout = VLMSceneScout(cfg, device=vlm_device)
+        self.vlm_scout.start()
 
 
     @torch.amp.autocast('cuda',enabled=True)
@@ -87,6 +93,11 @@ class MotionFilter:
                 if self.cfg['mapping']["uncertainty_params"]['activate']:
                     _ = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device,save_feat=True)
             self.video.append(tstamp, image[0], Id, 1.0, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0,0], inp[0,0], dino_features)
+            # Submit first keyframe to VLM scout for class discovery
+            self.vlm_scout.submit_keyframe(
+                image[0].permute(1, 2, 0).cpu().numpy().astype('uint8'),
+                keyframe_idx=0,
+            )
         ### only add new frame if there is enough motion ###
         else:
             # index correlation volume
@@ -122,6 +133,11 @@ class MotionFilter:
                 # add new frame to video, all params
                 self.video.append(tstamp, image[0], None, None, mono_depth, intrinsics / float(self.video.down_scale), gmap, net[0], inp[0], dino_features)
                 # gmap: torch.Size([1, 128, 45, 80]) net[0]: [128, 45, 80] inp: [1, 128, 45, 80], dino_features: [25, 45, 384]
+                # Submit keyframe to VLM scout for class discovery
+                self.vlm_scout.submit_keyframe(
+                    image[0].permute(1, 2, 0).cpu().numpy().astype('uint8'),
+                    keyframe_idx=self.video.counter.value - 1,
+                )
             else:
                 self.count += 1
 

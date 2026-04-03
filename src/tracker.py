@@ -139,8 +139,13 @@ class Tracker:
             prev_kf_idx = curr_kf_idx
             self.printer.update_pbar()
 
+        # Save VLM-discovered classes and stop scout before ending
+        self.motion_filter.vlm_scout.stop()
+        if self.motion_filter.vlm_scout.enabled:
+            self.motion_filter.vlm_scout.save_classes(self.output)
+
         self.pipe.send({"is_keyframe":True, "video_idx":None,
-                        "timestamp":None, "just_initialized": False, 
+                        "timestamp":None, "just_initialized": False,
                         "end":True})
 
                 
