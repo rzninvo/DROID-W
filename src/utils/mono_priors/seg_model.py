@@ -18,6 +18,7 @@ import os
 import json
 
 import numpy as np
+import cv2
 import torch
 
 
@@ -496,38 +497,47 @@ def classify_detections_by_uncertainty(
     """
     Tag each detection as static or dynamic using DROID-W's uncertainty map.
 
-    Uses the Nth percentile of uncertainty inside each box rather than the
-    mean.  This is robust to bounding boxes that include background pixels
-    (low uncertainty) which would dilute a simple mean and cause false
-    negatives on genuinely dynamic objects.
+    If a detection has a 'mask' field (from FastSAM), uncertainty is sampled
+    inside the mask — no background contamination. Otherwise falls back to
+    box-based sampling. The Nth percentile (default 75th) is used inside the
+    region to stay robust against per-pixel noise.
 
     Args:
-        detections: List of detection dicts from detect_objects() or track_objects().
+        detections: List of detection dicts. Each may carry an optional
+                    'mask': np.uint8 (img_h, img_w) from FastSAM.
         uncertainty_map: DROID-W uncertainty tensor at any resolution.
-        threshold: Percentile value above this → dynamic. Use
-                   compute_adaptive_threshold() for scene-adaptive values.
+        threshold: Score above this → dynamic.
         percentile: Which percentile to use (default 75th).
 
     Returns:
         Same detections with added 'is_dynamic' and 'dynamic_confidence' fields.
     """
     u_h, u_w = uncertainty_map.shape[-2], uncertainty_map.shape[-1]
+    u_np = uncertainty_map.detach().cpu().numpy() if isinstance(uncertainty_map, torch.Tensor) else uncertainty_map
 
     for det in detections:
-        x1, y1, x2, y2 = det["box"]
         img_h, img_w = det["img_h"], det["img_w"]
+        score = 0.0
 
-        # Scale box from image resolution to uncertainty map resolution
-        bx1 = max(0, int(x1 * u_w / img_w))
-        by1 = max(0, int(y1 * u_h / img_h))
-        bx2 = min(u_w, int(x2 * u_w / img_w))
-        by2 = min(u_h, int(y2 * u_h / img_h))
+        mask = det.get("mask")
+        if mask is not None and mask.any():
+            # Downsample mask to uncertainty-map resolution, sample only masked pixels
+            m_small = cv2.resize(mask.astype(np.uint8), (u_w, u_h), interpolation=cv2.INTER_NEAREST)
+            vals = u_np[m_small == 1]
+            if vals.size > 20:
+                score = float(np.quantile(vals, percentile / 100.0))
+            else:
+                mask = None  # fall through to box sampling
 
-        if bx2 > bx1 and by2 > by1:
-            region = uncertainty_map[by1:by2, bx1:bx2].flatten()
-            score = torch.quantile(region.float(), percentile / 100.0).item()
-        else:
-            score = 0.0
+        if mask is None or not mask.any() or score == 0.0:
+            x1, y1, x2, y2 = det["box"]
+            bx1 = max(0, int(x1 * u_w / img_w))
+            by1 = max(0, int(y1 * u_h / img_h))
+            bx2 = min(u_w, int(x2 * u_w / img_w))
+            by2 = min(u_h, int(y2 * u_h / img_h))
+            if bx2 > bx1 and by2 > by1:
+                region = uncertainty_map[by1:by2, bx1:bx2].flatten()
+                score = torch.quantile(region.float(), percentile / 100.0).item()
 
         det["dynamic_confidence"] = score
         det["is_dynamic"] = score > threshold
