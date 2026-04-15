@@ -74,15 +74,26 @@ ATTRIBUTE_WORDS = {
     "plastic", "striped", "colored", "coloured",
 }
 
-# VLM prompt for object discovery
+# VLM prompt for object discovery — multi-pass + JSON to disambiguate
+# CLIP-near-duplicates ("tv" vs "monitor") at the source. Asking for compound
+# nouns ("computer monitor", "office chair") pushes embeddings apart so the
+# CLIP-similarity dedup pass needs to fire less often.
 DISCOVERY_PROMPT = (
-    "List every distinct object you can see in this image. "
-    "Include large objects (furniture, vehicles, walls) AND small objects "
-    "(door handles, mugs, switches, books, bottles, pens, cables). "
-    "Include structural elements (door, window, shelf, radiator, vent). "
-    "Include things on surfaces (monitor, keyboard, plant, photo frame). "
-    "Use common, short nouns. Be extremely thorough — list even partially visible objects. "
-    "Return ONLY a comma-separated list, nothing else."
+    "Analyze this image in two steps and reply ONLY with a JSON object.\n"
+    "Step 1 — In one short phrase, identify the scene type "
+    '(e.g. "office", "kitchen", "outdoor street", "lecture hall").\n'
+    "Step 2 — List every distinct object you can see, using SPECIFIC compound "
+    "nouns when needed:\n"
+    '  - "computer monitor" not "monitor"\n'
+    '  - "office chair" not "chair"\n'
+    '  - "coffee mug" not "cup"\n'
+    '  - "desk lamp" not "lamp"\n'
+    "  - structural elements (door, window, radiator, vent, shelf)\n"
+    "  - small items (cable, photo frame, door handle, light switch, keyboard)\n"
+    "Be thorough — include partially visible items. Use lowercase nouns only "
+    "(no colors, sizes, or materials).\n"
+    'Reply EXACTLY in this JSON form, no extra text:\n'
+    '{"scene": "<scene type>", "objects": ["<obj1>", "<obj2>", ...]}'
 )
 
 
@@ -159,38 +170,60 @@ def _query_vlm(model, processor, image_np: np.ndarray, device: str) -> str:
 
 def parse_vlm_response(response: str) -> List[str]:
     """
-    Parse VLM comma-separated response into clean class names.
+    Parse the VLM response into clean class names.
 
-    Handles common VLM quirks: numbered lists, bullet points, extra whitespace,
-    quotes, periods, and mixed formatting. Strips color/size adjectives so
-    "blue tshirt" becomes "tshirt" (which then gets filtered by IGNORE_CLASSES).
+    Tries the new JSON output format first ({"scene": "...", "objects": [...]});
+    falls back to the legacy comma-list parser if the response is unstructured.
+    Strips color/size adjectives ("blue tshirt" → "tshirt") and filters
+    IGNORE_CLASSES.
 
     Args:
         response: Raw text from VLM.
 
     Returns:
-        List of cleaned, lowercase class names.
+        List of cleaned, lowercase class names. Compound nouns are preserved
+        ("office chair" stays as "office chair").
     """
     import re
+    import json
 
-    # Handle numbered lists: "1. person, 2. car" or "1) person"
-    response = re.sub(r'\d+[\.\)]\s*', '', response)
-    # Remove bullet points
-    response = re.sub(r'[-*•]\s*', '', response)
-    # Remove quotes
-    response = response.replace('"', '').replace("'", "")
+    raw_objects: List[str] = []
+    scene_name: Optional[str] = None
 
-    # Split by comma or newline
-    parts = re.split(r'[,\n]', response)
+    # Try JSON path first — robust to text wrapping the JSON block
+    json_match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+    if json_match:
+        try:
+            obj = json.loads(json_match.group(0))
+            if isinstance(obj, dict):
+                if isinstance(obj.get("objects"), list):
+                    raw_objects = [str(x) for x in obj["objects"]]
+                if isinstance(obj.get("scene"), str):
+                    scene_name = obj["scene"].strip().lower()
+        except (ValueError, TypeError):
+            pass
+
+    # Legacy comma-list fallback
+    if not raw_objects:
+        response = re.sub(r'\d+[\.\)]\s*', '', response)
+        response = re.sub(r'[-*•]\s*', '', response)
+        response = response.replace('"', '').replace("'", "")
+        raw_objects = re.split(r'[,\n]', response)
 
     classes = []
-    for part in parts:
-        name = part.strip().lower().rstrip('.')
+    for part in raw_objects:
+        name = str(part).strip().lower().rstrip('.')
         # Skip empty or overly long entries (VLM hallucination)
         if not name or len(name) >= 40 or len(name) <= 1:
             continue
 
-        # Strip attribute words (e.g., "blue tshirt" → "tshirt")
+        # Don't accept the scene type as an object
+        if scene_name and name == scene_name:
+            continue
+
+        # Strip attribute words (e.g., "blue tshirt" → "tshirt"). Compound
+        # nouns like "office chair" are preserved because none of their words
+        # are attribute words.
         words = name.split()
         words = [w for w in words if w not in ATTRIBUTE_WORDS]
         name = " ".join(words).strip()
@@ -231,15 +264,29 @@ class VLMSceneScout:
         self.enabled = vlm_cfg.get("activate", False)
         self.max_classes = vlm_cfg.get("max_classes", 200)
 
+        # SOTA pattern (ConceptGraphs / HOV-SG / CLIO / Mosaic3D / OVO-SLAM):
+        # discover the vocabulary entirely from the VLM. The DEFAULT_CLASSES
+        # seed is kept ONLY as a fallback for runs where the VLM is disabled.
+        self.use_default_seed = vlm_cfg.get("use_default_seed", False)
+
+        # CLIP-similarity vocabulary deduplication ("tv" ≈ "monitor", ...)
+        # Default 0.85: ConceptGraphs uses 0.8, HOV-SG uses 0.85–0.9.
+        # 0.85 catches "tv"≈"monitor" / "couch"≈"sofa" without over-collapsing.
+        self.dedupe_clip_threshold = vlm_cfg.get("dedupe_clip_threshold", 0.85)
+        self.dedupe_clip_model = vlm_cfg.get("dedupe_clip_model", "ViT-B-32")
+        self._clip_dedup = None  # lazy-loaded (model, tokenizer) tuple
+
         # Adaptive-gating state — count queries since last vocabulary growth.
         self._queries_since_growth = 0
 
-        # Thread-safe class storage — seeded with DEFAULT_CLASSES so common
-        # objects (person, car, chair, etc.) are always detected even if
-        # the VLM misses them. VLM adds scene-specific classes on top.
-        from src.utils.mono_priors.seg_model import DEFAULT_CLASSES
+        # Thread-safe class storage. Seed only if explicitly requested or if
+        # VLM discovery is disabled (otherwise we'd fight the VLM's choices).
         self._lock = threading.Lock()
-        self._classes: Set[str] = {c.lower() for c in DEFAULT_CLASSES}
+        if self.use_default_seed or not self.enabled:
+            from src.utils.mono_priors.seg_model import DEFAULT_CLASSES
+            self._classes: Set[str] = {c.lower() for c in DEFAULT_CLASSES}
+        else:
+            self._classes: Set[str] = set()
         self._classes_changed = True
         self._class_list_version = 1
 
@@ -286,6 +333,12 @@ class VLMSceneScout:
                     self._classes.add(cls)
                     new_classes.append(cls)
             if new_classes:
+                # CLIP-merge any near-duplicates introduced by this batch
+                # (e.g. discovered "monitor" while seed already had "computer
+                # monitor"). Keeps the canonical name per cluster.
+                deduped = set(self.dedupe_classes(sorted(self._classes)))
+                if deduped != self._classes:
+                    self._classes = deduped
                 self._classes_changed = True
                 self._class_list_version += 1
                 self._queries_since_growth = 0
@@ -296,6 +349,83 @@ class VLMSceneScout:
             logger.info(f"VLM discovered {len(new_classes)} new classes: {new_classes}")
 
         return new_classes
+
+    def _ensure_clip_dedup_loaded(self):
+        """Lazy-load OpenCLIP for class-list deduplication. Loaded once."""
+        if self._clip_dedup is not None:
+            return
+        try:
+            import open_clip
+        except ImportError:
+            logger.warning("open_clip not available — CLIP dedup disabled")
+            self._clip_dedup = (None, None)
+            return
+        model, _, _ = open_clip.create_model_and_transforms(
+            self.dedupe_clip_model, pretrained="openai"
+        )
+        model.eval().to(self.device)
+        tokenizer = open_clip.get_tokenizer(self.dedupe_clip_model)
+        self._clip_dedup = (model, tokenizer)
+
+    def dedupe_classes(
+        self, classes: List[str], threshold: Optional[float] = None
+    ) -> List[str]:
+        """
+        Merge CLIP-near-duplicate class names. ConceptGraphs / HOV-SG style.
+
+        Pairs of names with cosine similarity ≥ threshold are clustered
+        (union-find). The most-specific name per cluster wins (token count,
+        then string length).
+
+        Examples (threshold ≈ 0.88, ViT-B-32):
+            ["tv", "monitor", "computer monitor"]   → ["computer monitor"]
+            ["couch", "sofa"]                       → ["couch"] or ["sofa"]
+            ["mug", "coffee mug", "cup"]            → ["coffee mug"]
+
+        If open_clip isn't installed or the input has < 2 entries, returns
+        the input unchanged.
+        """
+        if not classes or len(classes) < 2:
+            return list(classes)
+        thr = float(threshold if threshold is not None else self.dedupe_clip_threshold)
+
+        self._ensure_clip_dedup_loaded()
+        model, tokenizer = self._clip_dedup
+        if model is None:
+            return list(classes)
+
+        with torch.no_grad():
+            tokens = tokenizer(classes).to(self.device)
+            emb = model.encode_text(tokens)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+            sim = (emb @ emb.T).cpu().numpy()
+
+        # Union-find clustering on CLIP cosine
+        parent = list(range(len(classes)))
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for i in range(len(classes)):
+            for j in range(i + 1, len(classes)):
+                if sim[i, j] >= thr:
+                    a, b = find(i), find(j)
+                    if a != b:
+                        parent[b] = a
+
+        clusters: dict = {}
+        for i, c in enumerate(classes):
+            clusters.setdefault(find(i), []).append(c)
+
+        canonical = []
+        for members in clusters.values():
+            # Most specific = most tokens, longest string as tiebreak
+            members.sort(key=lambda s: (-len(s.split()), -len(s), s))
+            canonical.append(members[0])
+            if len(members) > 1:
+                logger.info(f"VLM dedup: merged {members} → '{members[0]}'")
+        return sorted(canonical)
 
     def get_classes(self) -> List[str]:
         """Get current discovered class list (thread-safe)."""
@@ -493,12 +623,13 @@ class VLMSceneScout:
         """
         Save discovered classes to JSON so post-processing can use them.
 
-        Called after SLAM finishes. The detection pipeline loads these
-        instead of using DEFAULT_CLASSES.
+        Runs a final CLIP-similarity dedup pass before saving so the on-disk
+        list is the canonical, non-redundant vocabulary. Called after SLAM
+        finishes.
         """
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, "vlm_classes.json")
-        classes = self.get_classes()
+        classes = self.dedupe_classes(self.get_classes())
         with open(path, "w") as f:
             json.dump({"classes": classes, "version": self.get_version()}, f, indent=2)
         logger.info(f"Saved {len(classes)} VLM-discovered classes to {path}")

@@ -171,6 +171,17 @@ vlm_scout:
   saturation_patience: 5        # stop querying after N consecutive queries added zero new classes
   max_classes: 200              # cap on total discovered classes
   device: 'cuda:0'              # device for VLM inference (can differ from SLAM device)
+  use_default_seed: False       # SOTA: discover entirely from VLM (no hardcoded COCO seed)
+  dedupe_clip_threshold: 0.85   # CLIP cosine sim ≥ this → merge classes (e.g. tv ≈ monitor). ConceptGraphs:0.8, HOV-SG:0.85-0.9
+  dedupe_clip_model: 'ViT-B-32' # OpenCLIP variant used for dedup
+
+# Open-vocab detector backend
+# 'yolov8s-worldv2.pt' → YOLO-World v2  (boxes only; pair with FastSAM)
+# 'yoloe-v8s-seg.pt'   → YOLOE ICCV 2025 (boxes + per-instance masks in one pass)
+# Other YOLOE variants: yoloe-v8m-seg.pt, yoloe-v8l-seg.pt, yoloe-11s-seg.pt, yoloe-11l-seg.pt
+detector:
+  model: 'yolov8s-worldv2.pt'   # change to 'yoloe-v8s-seg.pt' to use YOLOE
+  conf_thresh: 0.2              # detection confidence threshold
 
 # Static/dynamic classification — log-odds fusion of three signals.
 # Conservative: defaults to STATIC, requires strong positive evidence to flip.

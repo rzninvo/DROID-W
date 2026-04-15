@@ -46,10 +46,47 @@ DEFAULT_CLASSES = [
     "bench", "trash can", "fire hydrant", "mailbox",
     "traffic light", "stop sign", "parking meter",
     "flag", "sign", "pole", "cone",
-    # Appliances & misc
-    "tv", "microwave", "oven", "refrigerator", "sink",
+    # Appliances & misc — note: "tv" intentionally omitted because YOLO-World
+    # confuses computer monitors with TVs in indoor scenes. The VLM scout
+    # will add "tv"/"television" if a real one is present.
+    "microwave", "oven", "refrigerator", "sink",
     "toilet", "fan", "robot vacuum", "toy", "ball",
 ]
+
+
+def _is_yoloe(model_name: str) -> bool:
+    """Detect a YOLOE checkpoint by name (yoloe-v8s-seg.pt, yoloe-11l-seg.pt, ...)."""
+    return "yoloe" in str(model_name).lower()
+
+
+def _is_yoloe_prompt_free(model_name: str) -> bool:
+    """YOLOE prompt-free variants (…-seg-pf.pt) have a fixed 4585-class vocab
+    and do NOT accept set_classes — skipping it prevents a crash."""
+    n = str(model_name).lower()
+    return "yoloe" in n and "pf" in n
+
+
+def _set_classes_unified(model, classes: List[str], is_yoloe: bool, is_prompt_free: bool = False):
+    """
+    Apply class vocabulary using whichever API the loaded model expects.
+
+    YOLO-World:        model.set_classes(classes)
+    YOLOE (prompted):  model.set_classes(classes, model.get_text_pe(classes))
+    YOLOE (-pf):       no-op — the prompt-free variant has a fixed vocabulary
+
+    YOLOE (prompted) requires the text-prompt embeddings explicitly because
+    RepRTA folds them into the model weights at inference time (zero-overhead
+    detection).
+    """
+    if is_prompt_free:
+        return
+    if not isinstance(classes, list) or len(classes) == 0:
+        return
+    if is_yoloe:
+        text_pe = model.get_text_pe(classes)
+        model.set_classes(classes, text_pe)
+    else:
+        model.set_classes(classes)
 
 
 def get_detector(
@@ -59,26 +96,33 @@ def get_detector(
     output_dir: str = None,
 ):
     """
-    Load YOLO-World detection model and set vocabulary.
+    Load an open-vocab detection model and set its vocabulary.
+
+    Supports two backends, selected by the model_name string:
+      - "yolov8s-worldv2.pt" (YOLO-World v2) — boxes only; pair with FastSAM
+      - "yoloe-v8s-seg.pt"   (YOLOE, ICCV 2025) — boxes + per-instance masks
+                                                  in one forward pass
 
     Class priority:
         1. Explicit `classes` argument (if provided)
         2. VLM-discovered classes from `output_dir/vlm_classes.json` (if exists)
         3. DEFAULT_CLASSES fallback (only when VLM is not used)
 
-    Args:
-        model_name: Ultralytics model name (auto-downloads weights).
-        classes: Text class list for open-vocab detection.
-        device: Device string.
-        output_dir: SLAM output directory — checked for VLM-discovered classes.
-
     Returns:
-        Loaded YOLO model with vocabulary set.
+        Loaded model with vocabulary set. Has an attribute `_is_yoloe` (bool)
+        to let downstream callers know which backend they're talking to.
     """
-    from ultralytics import YOLO
-
-    model = YOLO(model_name)
+    is_yoloe = _is_yoloe(model_name)
+    is_prompt_free = _is_yoloe_prompt_free(model_name)
+    if is_yoloe:
+        from ultralytics import YOLOE
+        model = YOLOE(model_name)
+    else:
+        from ultralytics import YOLO
+        model = YOLO(model_name)
     model.to(device)
+    model._is_yoloe = is_yoloe  # tag the instance so callers don't need to re-check the name
+    model._is_prompt_free = is_prompt_free
 
     # Resolve class list: explicit > VLM-discovered > fallback
     if classes is None and output_dir is not None:
@@ -90,26 +134,46 @@ def get_detector(
     if classes is None:
         classes = DEFAULT_CLASSES
 
-    if isinstance(classes, list) and len(classes) > 0:
-        model.set_classes(classes)
-
+    _set_classes_unified(model, classes, is_yoloe, is_prompt_free)
     return model
 
 
 def update_detector_classes(model, classes: List[str]):
     """
-    Update YOLO-World vocabulary with a new class list.
+    Update the detector's vocabulary in-place.
 
     Called when the VLM scene scout discovers new object types. Re-encodes
-    text prompts into CLIP embeddings (~50ms), so only call when the list
-    actually changes.
-
-    Args:
-        model: YOLO-World model from get_detector().
-        classes: Updated text class list.
+    text prompts into CLIP embeddings, so only call when the list actually
+    changes. No-op for YOLOE prompt-free models (fixed vocab).
     """
-    if isinstance(classes, list) and len(classes) > 0:
-        model.set_classes(classes)
+    is_yoloe = bool(getattr(model, "_is_yoloe", False))
+    is_prompt_free = bool(getattr(model, "_is_prompt_free", False))
+    _set_classes_unified(model, classes, is_yoloe, is_prompt_free)
+
+
+def _extract_masks_at_image_res(result, H: int, W: int) -> Optional[np.ndarray]:
+    """
+    Pull per-instance binary masks from an Ultralytics result, reshaped to
+    (N, H, W) uint8 in {0, 1}. Returns None if the result has no masks.
+
+    Handles both `retina_masks=True` (full-res) and the default down-sampled
+    case by resizing per-mask via nearest-neighbor.
+    """
+    if getattr(result, "masks", None) is None or result.masks is None:
+        return None
+    md = result.masks.data
+    if md is None or len(md) == 0:
+        return None
+    arr = md.detach().cpu().numpy()
+    if arr.ndim == 2:
+        arr = arr[None]
+    arr = (arr > 0.5).astype(np.uint8)
+    if arr.shape[1] != H or arr.shape[2] != W:
+        out = np.zeros((arr.shape[0], H, W), dtype=np.uint8)
+        for i in range(arr.shape[0]):
+            out[i] = cv2.resize(arr[i], (W, H), interpolation=cv2.INTER_NEAREST)
+        arr = out
+    return arr
 
 
 @torch.no_grad()
@@ -121,17 +185,20 @@ def detect_objects(
     """
     Run open-vocabulary detection on a single frame (no tracking).
 
-    Args:
-        model: YOLO-World model from get_detector().
-        image_np: uint8 numpy array (H, W, 3) in RGB.
-        conf_thresh: Minimum detection confidence.
+    For YOLOE-seg models, also extracts a per-instance pixel mask and attaches
+    it to each detection under the 'mask' key. For YOLO-World, the 'mask'
+    field is omitted (callers can fill it via FastSAM).
 
     Returns:
         List of detections, each a dict with:
-            box, label, confidence, class_id, img_h, img_w
+            box, label, confidence, class_id, img_h, img_w, [mask]
     """
     H, W = image_np.shape[:2]
-    results = model.predict(image_np, conf=conf_thresh, imgsz=1280, verbose=False)
+    is_yoloe = bool(getattr(model, "_is_yoloe", False))
+    predict_kwargs = dict(conf=conf_thresh, imgsz=1280, verbose=False)
+    if is_yoloe:
+        predict_kwargs["retina_masks"] = True
+    results = model.predict(image_np, **predict_kwargs)
 
     detections = []
     if results and len(results) > 0:
@@ -140,17 +207,21 @@ def detect_objects(
             boxes = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
             classes = result.boxes.cls.cpu().numpy().astype(int)
+            masks = _extract_masks_at_image_res(result, H, W) if is_yoloe else None
 
             for i in range(len(classes)):
                 label = result.names.get(classes[i], str(classes[i])) if result.names else str(classes[i])
-                detections.append({
+                det = {
                     "box": boxes[i].tolist(),
                     "label": label,
                     "confidence": float(confs[i]),
                     "class_id": int(classes[i]),
                     "img_h": H,
                     "img_w": W,
-                })
+                }
+                if masks is not None and i < len(masks):
+                    det["mask"] = masks[i]
+                detections.append(det)
 
     return detections
 
@@ -194,7 +265,11 @@ def track_objects(
             img_w: int
     """
     H, W = image_np.shape[:2]
-    results = model.track(image_np, conf=conf_thresh, imgsz=1280, persist=True, tracker=tracker, verbose=False)
+    is_yoloe = bool(getattr(model, "_is_yoloe", False))
+    track_kwargs = dict(conf=conf_thresh, imgsz=1280, persist=True, tracker=tracker, verbose=False)
+    if is_yoloe:
+        track_kwargs["retina_masks"] = True
+    results = model.track(image_np, **track_kwargs)
 
     detections = []
     if results and len(results) > 0:
@@ -203,6 +278,7 @@ def track_objects(
             boxes = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
             classes = result.boxes.cls.cpu().numpy().astype(int)
+            masks = _extract_masks_at_image_res(result, H, W) if is_yoloe else None
 
             # track IDs may not exist if tracker loses the object
             if result.boxes.id is not None:
@@ -212,7 +288,7 @@ def track_objects(
 
             for i in range(len(classes)):
                 label = result.names.get(classes[i], str(classes[i])) if result.names else str(classes[i])
-                detections.append({
+                det = {
                     "box": boxes[i].tolist(),
                     "label": label,
                     "confidence": float(confs[i]),
@@ -221,7 +297,10 @@ def track_objects(
                     "frame_idx": frame_idx,
                     "img_h": H,
                     "img_w": W,
-                })
+                }
+                if masks is not None and i < len(masks):
+                    det["mask"] = masks[i]
+                detections.append(det)
 
     return detections
 
