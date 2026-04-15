@@ -172,7 +172,8 @@ vlm_scout:
   max_classes: 200              # cap on total discovered classes
   device: 'cuda:0'              # device for VLM inference (can differ from SLAM device)
 
-# Static/dynamic classification — log-odds fusion of three signals
+# Static/dynamic classification — log-odds fusion of three signals.
+# Conservative: defaults to STATIC, requires strong positive evidence to flip.
 dynamic_classification:
   use_reprojection: True
   use_movability_prior: True
@@ -180,6 +181,9 @@ dynamic_classification:
   logodds_alpha: 1.0            # weight of VLM movability prior
   logodds_beta: 1.0             # weight of mask-uncertainty evidence
   logodds_gamma: 1.0            # weight of reprojection-consistency evidence
+  static_bias: 1.5              # negative offset; need this much evidence to flip dynamic
+  movability_floor: 0.7         # below this p_movable, prior contributes 0 (chair, cup, etc.)
+  reproj_gate: 0.6              # above this hit-rate, geometric evidence contributes 0
   reproj_sample_points: 100
   reproj_hit_threshold_px: 8
 

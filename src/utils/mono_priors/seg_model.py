@@ -747,27 +747,37 @@ def classify_tracks_logodds(
     beta: float = 1.0,
     gamma: float = 1.0,
     unc_scale: Optional[float] = None,
+    static_bias: float = 1.5,
+    movability_floor: float = 0.7,
+    reproj_gate: float = 0.6,
 ) -> Dict[int, Dict]:
     """
-    Fuse three signals into a per-track log-odds score:
+    Conservative log-odds fusion. Defaults to STATIC; flips to dynamic only
+    when at least one signal gives strong evidence of motion.
 
-        log_odds = α·logit(p_movable)
-                 + β·mean((score_f - threshold) / unc_scale)   # per-frame uncertainty
-                 + γ·logit(1 - reproj_hit_rate)                # geometric evidence
+        log_odds = -static_bias
+                 + α · max(0, logit(p_movable) - logit(movability_floor))
+                 + β · max(0, mean((score_f - threshold) / unc_scale))
+                 + γ · max(0, logit(1 - hit) - logit(1 - reproj_gate))
 
     is_dynamic = (log_odds > 0).
 
-    Any signal can be absent: p_movable defaults to 0.5, reproj_hit_rate to 1.0
-    (no geometric evidence against static), and the uncertainty term falls back
-    to mean_dynamic_confidence if no per-frame scores are present.
+    Why each piece:
+    - **static_bias** — without strong positive evidence, default static.
+      Avoids "noisy chair flicker → dynamic" failure mode.
+    - **movability_floor** — only classes the VLM clearly labels as self-moving
+      (p ≥ 0.7) contribute positively. A chair (p≈0.5) contributes 0, not +0.85.
+    - **reproj_gate** — geometric evidence only fires when hit-rate is clearly
+      bad (< 0.6). Above that, the noise floor of depth/pose drift dominates.
+    - All terms are **one-sided** (max(0, ·)) — signals can argue FOR dynamic
+      but cannot argue AGAINST a clearly-moving object via low evidence.
 
-    Stores debug fields on the track: p_movable, reproj_hit_rate,
-    mean_unc_evidence, logodds.
+    Stores debug fields: p_movable, reproj_hit_rate, mean_unc_evidence,
+    mov_term, unc_term, reproj_term, logodds.
     """
     reproj_hits = reproj_hits or {}
     movability = movability or {}
 
-    # Collect per-frame uncertainty evidence per track
     frame_scores: Dict[int, List[float]] = {}
     for frame_dets in all_detections:
         for det in frame_dets:
@@ -776,9 +786,11 @@ def classify_tracks_logodds(
                 continue
             frame_scores.setdefault(tid, []).append(float(det["dynamic_confidence"]))
 
-    # Auto scale if not provided: use the threshold itself
     if unc_scale is None or unc_scale <= 0:
         unc_scale = max(float(threshold), 1e-3)
+
+    mov_floor_logit = _logit(movability_floor)
+    reproj_floor_logit = _logit(1.0 - reproj_gate)
 
     for tid, t in tracks.items():
         label = t.get("label", "")
@@ -791,11 +803,18 @@ def classify_tracks_logodds(
         else:
             unc_ev = (t.get("mean_dynamic_confidence", 0.0) - threshold) / unc_scale
 
-        lo = alpha * _logit(p_mov) + beta * unc_ev + gamma * _logit(1.0 - hit)
+        mov_term    = max(0.0, _logit(p_mov) - mov_floor_logit)
+        unc_term    = max(0.0, unc_ev)
+        reproj_term = max(0.0, _logit(1.0 - hit) - reproj_floor_logit)
+
+        lo = -static_bias + alpha * mov_term + beta * unc_term + gamma * reproj_term
 
         t["p_movable"] = p_mov
         t["reproj_hit_rate"] = hit
         t["mean_unc_evidence"] = unc_ev
+        t["mov_term"] = mov_term
+        t["unc_term"] = unc_term
+        t["reproj_term"] = reproj_term
         t["logodds"] = lo
         t["is_dynamic"] = lo > 0.0
 
