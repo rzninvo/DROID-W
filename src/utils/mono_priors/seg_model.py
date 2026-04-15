@@ -493,14 +493,14 @@ def classify_detections_by_uncertainty(
     uncertainty_map: torch.Tensor,
     threshold: float = 0.6,
     percentile: float = 75.0,
+    erode_mask_px: int = 2,
 ) -> List[Dict]:
     """
     Tag each detection as static or dynamic using DROID-W's uncertainty map.
 
     If a detection has a 'mask' field (from FastSAM), uncertainty is sampled
-    inside the mask — no background contamination. Otherwise falls back to
-    box-based sampling. The Nth percentile (default 75th) is used inside the
-    region to stay robust against per-pixel noise.
+    inside the eroded mask — the erosion (NID-SLAM style) removes unreliable
+    boundary pixels. Falls back to box sampling if no mask.
 
     Args:
         detections: List of detection dicts. Each may carry an optional
@@ -508,6 +508,7 @@ def classify_detections_by_uncertainty(
         uncertainty_map: DROID-W uncertainty tensor at any resolution.
         threshold: Score above this → dynamic.
         percentile: Which percentile to use (default 75th).
+        erode_mask_px: Pixels to erode off mask boundary before sampling.
 
     Returns:
         Same detections with added 'is_dynamic' and 'dynamic_confidence' fields.
@@ -518,18 +519,22 @@ def classify_detections_by_uncertainty(
     for det in detections:
         img_h, img_w = det["img_h"], det["img_w"]
         score = 0.0
+        used_mask = False
 
         mask = det.get("mask")
         if mask is not None and mask.any():
-            # Downsample mask to uncertainty-map resolution, sample only masked pixels
             m_small = cv2.resize(mask.astype(np.uint8), (u_w, u_h), interpolation=cv2.INTER_NEAREST)
+            if erode_mask_px > 0:
+                k = 2 * erode_mask_px + 1
+                m_eroded = cv2.erode(m_small, np.ones((k, k), np.uint8), iterations=1)
+                if m_eroded.sum() >= 20:
+                    m_small = m_eroded
             vals = u_np[m_small == 1]
-            if vals.size > 20:
+            if vals.size >= 20:
                 score = float(np.quantile(vals, percentile / 100.0))
-            else:
-                mask = None  # fall through to box sampling
+                used_mask = True
 
-        if mask is None or not mask.any() or score == 0.0:
+        if not used_mask:
             x1, y1, x2, y2 = det["box"]
             bx1 = max(0, int(x1 * u_w / img_w))
             by1 = max(0, int(y1 * u_h / img_h))
@@ -588,5 +593,210 @@ def classify_tracks_by_uncertainty(
             t["dynamic_ratio"] = 0.0
             t["mean_dynamic_confidence"] = 0.0
             t["is_dynamic"] = False
+
+    return tracks
+
+
+def _pose_to_Rt(pose_7: np.ndarray) -> np.ndarray:
+    """
+    Convert a DROID-SLAM pose (tx,ty,tz,qx,qy,qz,qw) to a 4x4 camera-to-world matrix.
+    Works for the (N,7) poses saved by DROID-W in video.npz.
+    """
+    tx, ty, tz, qx, qy, qz, qw = pose_7
+    n = qx*qx + qy*qy + qz*qz + qw*qw
+    if n < 1e-12:
+        R = np.eye(3)
+    else:
+        s = 2.0 / n
+        R = np.array([
+            [1 - s*(qy*qy+qz*qz),     s*(qx*qy-qz*qw),     s*(qx*qz+qy*qw)],
+            [    s*(qx*qy+qz*qw), 1 - s*(qx*qx+qz*qz),     s*(qy*qz-qx*qw)],
+            [    s*(qx*qz-qy*qw),     s*(qy*qz+qx*qw), 1 - s*(qx*qx+qy*qy)],
+        ])
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = [tx, ty, tz]
+    return T
+
+
+def compute_reprojection_consistency(
+    tracks: Dict[int, Dict],
+    all_detections: List[List[Dict]],
+    poses: np.ndarray,
+    depths: np.ndarray,
+    intrinsics: np.ndarray,
+    sample_points: int = 100,
+    hit_threshold_px: int = 8,
+) -> Dict[int, float]:
+    """
+    Per-track mean reprojection hit-rate ∈ [0, 1]. Near 1.0 = static.
+
+    Samples ~`sample_points` mask-interior pixels in an anchor keyframe,
+    back-projects with anchor depth + pose, reprojects into every other
+    keyframe of the track, and counts hits inside that frame's mask (or
+    within `hit_threshold_px` of the mask). If an object actually moved in
+    3D between keyframes, the reprojections fall off the moved mask → low
+    hit-rate → dynamic.
+
+    Inputs are read directly from video.npz:
+        poses:      (N, 7) — DROID-SLAM pose (t, q) per keyframe
+        depths:     (N, H, W) — keyframe depths (from 1/disps in video.npz)
+        intrinsics: (3, 3) — shared pinhole intrinsics
+
+    Returns: {track_id: mean_hit_rate}.  Missing tracks → 1.0 (no penalty).
+    """
+    if poses is None or depths is None or intrinsics is None:
+        return {tid: 1.0 for tid in tracks}
+
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    _, H, W = depths.shape
+
+    # Per-track frame lookup: track_id -> {frame_idx: det}
+    track_frames: Dict[int, Dict[int, Dict]] = {}
+    for frame_dets in all_detections:
+        for det in frame_dets:
+            tid = det.get("track_id", -1)
+            if tid < 0 or det.get("mask") is None:
+                continue
+            track_frames.setdefault(tid, {})[det["frame_idx"]] = det
+
+    hit_rates: Dict[int, float] = {}
+
+    for tid, frames in track_frames.items():
+        if len(frames) < 2:
+            hit_rates[tid] = 1.0
+            continue
+
+        # Anchor = frame with largest mask
+        anchor_idx = max(frames.keys(), key=lambda i: int(frames[i]["mask"].sum()))
+        anchor = frames[anchor_idx]
+        mask_a = anchor["mask"]
+        ys, xs = np.where(mask_a > 0)
+        if ys.size == 0:
+            hit_rates[tid] = 1.0
+            continue
+
+        # Sparse sample
+        if ys.size > sample_points:
+            sel = np.random.choice(ys.size, size=sample_points, replace=False)
+            ys, xs = ys[sel], xs[sel]
+
+        # Back-project anchor pixels to camera frame
+        d_a = depths[anchor_idx][ys, xs]
+        valid = d_a > 1e-3
+        if valid.sum() < 10:
+            hit_rates[tid] = 1.0
+            continue
+        xs, ys, d_a = xs[valid], ys[valid], d_a[valid]
+        X_cam = np.stack([(xs - cx) * d_a / fx, (ys - cy) * d_a / fy, d_a], axis=1)  # (M, 3)
+        X_cam_h = np.concatenate([X_cam, np.ones((X_cam.shape[0], 1))], axis=1)       # (M, 4)
+
+        T_a_cw = _pose_to_Rt(poses[anchor_idx])                                       # cam->world
+        X_w = (T_a_cw @ X_cam_h.T).T[:, :3]                                           # world coords
+
+        hits_total, total = 0, 0
+        for f_idx, det in frames.items():
+            if f_idx == anchor_idx:
+                continue
+            T_f_cw = _pose_to_Rt(poses[f_idx])
+            T_f_wc = np.linalg.inv(T_f_cw)                                            # world->cam
+            X_f = (T_f_wc[:3, :3] @ X_w.T).T + T_f_wc[:3, 3]                          # (M, 3)
+            z = X_f[:, 2]
+            ok = z > 1e-3
+            if ok.sum() == 0:
+                continue
+            u = fx * X_f[ok, 0] / z[ok] + cx
+            v = fy * X_f[ok, 1] / z[ok] + cy
+            u_i = np.round(u).astype(int); v_i = np.round(v).astype(int)
+            in_bounds = (u_i >= 0) & (u_i < W) & (v_i >= 0) & (v_i < H)
+            if in_bounds.sum() == 0:
+                continue
+            u_i, v_i = u_i[in_bounds], v_i[in_bounds]
+            m_f = det["mask"]
+            # Hit = inside mask OR within hit_threshold_px (dilated mask)
+            if hit_threshold_px > 0:
+                k = 2 * hit_threshold_px + 1
+                m_f_d = cv2.dilate(m_f.astype(np.uint8), np.ones((k, k), np.uint8), 1)
+            else:
+                m_f_d = m_f
+            hits = int(m_f_d[v_i, u_i].sum())
+            hits_total += hits
+            total += int(in_bounds.sum())
+
+        hit_rates[tid] = (hits_total / total) if total > 0 else 1.0
+
+    # Fill missing tracks with 1.0 (no geometric evidence against them)
+    for tid in tracks:
+        hit_rates.setdefault(tid, 1.0)
+    return hit_rates
+
+
+def _logit(p: float, eps: float = 1e-4) -> float:
+    p = float(np.clip(p, eps, 1.0 - eps))
+    return float(np.log(p / (1.0 - p)))
+
+
+def classify_tracks_logodds(
+    tracks: Dict[int, Dict],
+    all_detections: List[List[Dict]],
+    reproj_hits: Optional[Dict[int, float]] = None,
+    movability: Optional[Dict[str, float]] = None,
+    threshold: float = 0.6,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    unc_scale: Optional[float] = None,
+) -> Dict[int, Dict]:
+    """
+    Fuse three signals into a per-track log-odds score:
+
+        log_odds = α·logit(p_movable)
+                 + β·mean((score_f - threshold) / unc_scale)   # per-frame uncertainty
+                 + γ·logit(1 - reproj_hit_rate)                # geometric evidence
+
+    is_dynamic = (log_odds > 0).
+
+    Any signal can be absent: p_movable defaults to 0.5, reproj_hit_rate to 1.0
+    (no geometric evidence against static), and the uncertainty term falls back
+    to mean_dynamic_confidence if no per-frame scores are present.
+
+    Stores debug fields on the track: p_movable, reproj_hit_rate,
+    mean_unc_evidence, logodds.
+    """
+    reproj_hits = reproj_hits or {}
+    movability = movability or {}
+
+    # Collect per-frame uncertainty evidence per track
+    frame_scores: Dict[int, List[float]] = {}
+    for frame_dets in all_detections:
+        for det in frame_dets:
+            tid = det.get("track_id", -1)
+            if tid < 0 or "dynamic_confidence" not in det:
+                continue
+            frame_scores.setdefault(tid, []).append(float(det["dynamic_confidence"]))
+
+    # Auto scale if not provided: use the threshold itself
+    if unc_scale is None or unc_scale <= 0:
+        unc_scale = max(float(threshold), 1e-3)
+
+    for tid, t in tracks.items():
+        label = t.get("label", "")
+        p_mov = float(movability.get(label, 0.5))
+        hit = float(reproj_hits.get(tid, 1.0))
+
+        scores = frame_scores.get(tid, [])
+        if scores:
+            unc_ev = float(np.mean([(s - threshold) / unc_scale for s in scores]))
+        else:
+            unc_ev = (t.get("mean_dynamic_confidence", 0.0) - threshold) / unc_scale
+
+        lo = alpha * _logit(p_mov) + beta * unc_ev + gamma * _logit(1.0 - hit)
+
+        t["p_movable"] = p_mov
+        t["reproj_hit_rate"] = hit
+        t["mean_unc_evidence"] = unc_ev
+        t["logodds"] = lo
+        t["is_dynamic"] = lo > 0.0
 
     return tracks

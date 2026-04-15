@@ -87,7 +87,7 @@ tracking:
   mono_thres: 0.1 # in DSPO, remove the edges if the average disp error of the aligned mono disp is larger than X*average_disp
                   # it can be set to False for keeping all edges.
   motion_filter:
-    thresh: 3.0     # add new frame as potential keyframe if avg flow >= X pixels
+    thresh: 2.4     # add new frame as potential keyframe if avg flow >= X pixels (DROID-SLAM paper range 2.4–4.0; denser keyframes help BoT-SORT + reprojection consistency)
   multiview_filter:
     thresh: 0.01    # eta in eq(6) of the paper
     visible_num: 2  # points need to be viewed by at least X cameras
@@ -166,9 +166,22 @@ mono_prior:
 vlm_scout:
   activate: False               # set True to enable VLM-based class discovery
   model: 'Qwen/Qwen2.5-VL-3B-Instruct'  # HuggingFace model ID
-  query_interval: 10            # query VLM every N keyframes (first KF always queried)
+  query_interval: 10            # periodic fallback cadence after warmup
+  warmup_keyframes: 5           # query every keyframe for first N KFs (aggressive bootstrap)
+  saturation_patience: 5        # stop querying after N consecutive queries added zero new classes
   max_classes: 200              # cap on total discovered classes
   device: 'cuda:0'              # device for VLM inference (can differ from SLAM device)
+
+# Static/dynamic classification — log-odds fusion of three signals
+dynamic_classification:
+  use_reprojection: True
+  use_movability_prior: True
+  erode_mask_px: 2
+  logodds_alpha: 1.0            # weight of VLM movability prior
+  logodds_beta: 1.0             # weight of mask-uncertainty evidence
+  logodds_gamma: 1.0            # weight of reprojection-consistency evidence
+  reproj_sample_points: 100
+  reproj_hit_threshold_px: 8
 
 data:
   output: ./output/wildgs_slam

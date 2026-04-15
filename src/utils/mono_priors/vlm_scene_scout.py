@@ -226,8 +226,13 @@ class VLMSceneScout:
         self.model_name = vlm_cfg.get("model", "Qwen/Qwen2.5-VL-3B-Instruct")
         self.device = device
         self.query_interval = vlm_cfg.get("query_interval", 10)
+        self.warmup_keyframes = vlm_cfg.get("warmup_keyframes", 5)
+        self.saturation_patience = vlm_cfg.get("saturation_patience", 5)
         self.enabled = vlm_cfg.get("activate", False)
         self.max_classes = vlm_cfg.get("max_classes", 200)
+
+        # Adaptive-gating state — count queries since last vocabulary growth.
+        self._queries_since_growth = 0
 
         # Thread-safe class storage — seeded with DEFAULT_CLASSES so common
         # objects (person, car, chair, etc.) are always detected even if
@@ -283,6 +288,9 @@ class VLMSceneScout:
             if new_classes:
                 self._classes_changed = True
                 self._class_list_version += 1
+                self._queries_since_growth = 0
+            else:
+                self._queries_since_growth += 1
 
         if new_classes:
             logger.info(f"VLM discovered {len(new_classes)} new classes: {new_classes}")
@@ -317,18 +325,30 @@ class VLMSceneScout:
             self._classes_changed = True
             self._class_list_version += 1
 
+    def should_query(self, keyframe_idx: int) -> bool:
+        """
+        Adaptive gating: aggressive sampling early, throttle once the
+        vocabulary saturates. Uses warmup_keyframes + saturation_patience
+        on top of query_interval.
+        """
+        if keyframe_idx < self.warmup_keyframes:
+            return True
+        if self._queries_since_growth >= self.saturation_patience:
+            return False
+        return keyframe_idx % self.query_interval == 0
+
     def submit_keyframe(self, image_np: np.ndarray, keyframe_idx: int):
         """
         Submit a keyframe for async VLM processing.
 
-        Only processes every Nth keyframe (based on query_interval).
-        First keyframe (idx 0) is always processed.
+        Gated by should_query() — queries every keyframe during warmup,
+        every `query_interval` after, and stops once vocabulary saturates.
         Non-blocking — drops frame if queue is full.
         """
         if not self.enabled:
             return
 
-        if keyframe_idx > 0 and keyframe_idx % self.query_interval != 0:
+        if not self.should_query(keyframe_idx):
             return
 
         try:
@@ -386,6 +406,88 @@ class VLMSceneScout:
                     )
             except Exception as e:
                 logger.warning(f"VLM scout error on keyframe {kf_idx}: {e}")
+
+    def classify_movability(self, classes: List[str], batch_size: int = 80) -> dict:
+        """
+        Ask the VLM to label each class with a movability score in [0, 1]:
+            0.0 = permanently fixed (wall, floor, ceiling)
+            0.5 = moved by a person (chair, cup, laptop)
+            1.0 = moves on its own (person, car, dog)
+
+        This replaces a hardcoded SEMANTIC_DYNAMIC_CLASSES set — the VLM
+        labels whatever was discovered. One batched call per run.
+        """
+        import re
+
+        if not classes:
+            return {}
+
+        self._ensure_loaded()
+        result: dict = {}
+
+        for start in range(0, len(classes), batch_size):
+            chunk = classes[start:start + batch_size]
+            listing = "\n".join(f"- {c}" for c in chunk)
+            prompt = (
+                "For each object class below, output a movability score from 0.0 to 1.0.\n"
+                "0.0 = permanently fixed (wall, floor, ceiling).\n"
+                "0.5 = can be moved by a person (chair, cup, laptop).\n"
+                "1.0 = moves on its own (person, car, dog, bicycle).\n"
+                "Reply with exactly one line per class in the form:\n"
+                "  class: score\n"
+                "No extra text. Here are the classes:\n"
+                f"{listing}"
+            )
+
+            # Text-only query path (reuse processor without an image)
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            text_input = self._processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self._processor(
+                text=[text_input], return_tensors="pt", padding=True
+            ).to(self.device)
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+            generated = output_ids[0, inputs.input_ids.shape[1]:]
+            response = self._processor.tokenizer.decode(generated, skip_special_tokens=True)
+
+            for line in response.splitlines():
+                m = re.match(r"\s*[-*•\d\.\)]*\s*(.+?)\s*[:\-]\s*([0-9]*\.?[0-9]+)", line)
+                if not m:
+                    continue
+                name = m.group(1).strip().lower().rstrip(".")
+                try:
+                    score = float(m.group(2))
+                except ValueError:
+                    continue
+                score = max(0.0, min(1.0, score))
+                if name in chunk:
+                    result[name] = score
+
+        # Default any missing classes to 0.5 (unknown → middling prior)
+        for c in classes:
+            result.setdefault(c, 0.5)
+
+        logger.info(f"Classified movability for {len(classes)} classes")
+        return result
+
+    def save_movability(self, output_dir: str, movability: dict):
+        """Save per-class movability scores for post-processing to reuse."""
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "vlm_movability.json")
+        with open(path, "w") as f:
+            json.dump(movability, f, indent=2)
+        logger.info(f"Saved movability for {len(movability)} classes to {path}")
+
+    @staticmethod
+    def load_movability(output_dir: str) -> Optional[dict]:
+        """Load per-class movability scores; returns None if not present."""
+        path = os.path.join(output_dir, "vlm_movability.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
 
     def save_classes(self, output_dir: str):
         """
