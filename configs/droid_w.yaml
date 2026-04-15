@@ -166,13 +166,13 @@ mono_prior:
 vlm_scout:
   activate: False               # set True to enable VLM-based class discovery
   model: 'Qwen/Qwen2.5-VL-3B-Instruct'  # HuggingFace model ID
-  query_interval: 10            # periodic fallback cadence after warmup
-  warmup_keyframes: 5           # query every keyframe for first N KFs (aggressive bootstrap)
-  saturation_patience: 5        # stop querying after N consecutive queries added zero new classes
-  max_classes: 200              # cap on total discovered classes
+  query_interval: 5             # periodic fallback cadence after warmup (was 10 — more queries = more recall)
+  warmup_keyframes: 8           # query every keyframe for first N KFs (aggressive bootstrap)
+  saturation_patience: 12       # stop querying after N consecutive queries added zero new classes (was 5 — too impatient)
+  max_classes: 300              # cap on total discovered classes (raised for cluttered scenes)
   device: 'cuda:0'              # device for VLM inference (can differ from SLAM device)
   use_default_seed: False       # SOTA: discover entirely from VLM (no hardcoded COCO seed)
-  dedupe_clip_threshold: 0.85   # CLIP cosine sim ≥ this → merge classes (e.g. tv ≈ monitor). ConceptGraphs:0.8, HOV-SG:0.85-0.9
+  dedupe_clip_threshold: 0.90   # CLIP cosine sim ≥ this → merge classes. Calibrated on ViT-B-32 (tv-monitor=0.902, couch-sofa=0.915). Lower values collide with unrelated office items.
   dedupe_clip_model: 'ViT-B-32' # OpenCLIP variant used for dedup
 
 # Open-vocab detector backend
@@ -180,8 +180,27 @@ vlm_scout:
 # 'yoloe-v8s-seg.pt'   → YOLOE ICCV 2025 (boxes + per-instance masks in one pass)
 # Other YOLOE variants: yoloe-v8m-seg.pt, yoloe-v8l-seg.pt, yoloe-11s-seg.pt, yoloe-11l-seg.pt
 detector:
-  model: 'yolov8s-worldv2.pt'   # change to 'yoloe-v8s-seg.pt' to use YOLOE
-  conf_thresh: 0.2              # detection confidence threshold
+  # Backend: 'mask_first' | 'yolo_world' | 'yoloe'
+  #   mask_first : FastSAM segment-everything + CLIP-per-mask classification
+  #                (ConceptGraphs / HOV-SG / OVO-SLAM paradigm — highest recall)
+  #   yolo_world : YOLO-World v2 + FastSAM box-prompted masks
+  #                (classic detect-first; lower recall on cluttered scenes)
+  #   yoloe      : YOLOE ICCV 2025 (detect-first with native masks, no FastSAM)
+  backend: 'mask_first'
+  # Detect-first settings (yolo_world / yoloe)
+  model: 'yolov8s-worldv2.pt'
+  conf_thresh: 0.12             # must be >= BoT-SORT's track_low_thresh=0.1
+  # Mask-first settings
+  clip_model: 'ViT-B-32'        # OpenCLIP backbone for per-mask classification
+  accept_thresh: 0.23           # min CLIP cosine sim to accept a label (ConceptGraphs uses 0.27 on ViT-H)
+  mask_iou_dedup: 0.55          # mask-IoU above this → suppress duplicate (was 0.65 — too lax)
+  containment_thresh: 0.60      # if sub_mask is this fraction inside a larger kept mask → drop it. Kills "poster with text/photo inside" over-segmentation
+  min_mask_area: 20             # drop noise masks smaller than this many pixels
+  max_masks: 120                # cap FastSAM proposals per frame
+  fastsam_imgsz: 1024
+  fastsam_conf: 0.4             # FastSAM region-proposal conf (lower = more masks)
+  tracker_iou_thresh: 0.3       # mask-IoU tracker: min IoU to match to prior track
+  tracker_max_age: 5            # keep unmatched tracks alive for N keyframes
 
 # Static/dynamic classification — log-odds fusion of three signals.
 # Conservative: defaults to STATIC, requires strong positive evidence to flip.
@@ -191,12 +210,14 @@ dynamic_classification:
   erode_mask_px: 2
   logodds_alpha: 1.0            # weight of VLM movability prior
   logodds_beta: 1.0             # weight of mask-uncertainty evidence
-  logodds_gamma: 1.0            # weight of reprojection-consistency evidence
+  logodds_gamma: 0.5            # weight of reprojection-consistency evidence (halved — noisy for small objects)
   static_bias: 1.5              # negative offset; need this much evidence to flip dynamic
   movability_floor: 0.7         # below this p_movable, prior contributes 0 (chair, cup, etc.)
-  reproj_gate: 0.6              # above this hit-rate, geometric evidence contributes 0
+  reproj_gate: 0.4              # above this hit-rate, geometric evidence contributes 0
+  reproj_term_cap: 2.0          # max positive contribution from reprojection — prevents hit=0 from dominating
+  min_frames_for_reproj: 4      # ignore reprojection for short tracks (anchor too noisy)
   reproj_sample_points: 100
-  reproj_hit_threshold_px: 8
+  reproj_hit_threshold_px: 15   # 15px dilation buffer for depth/pose noise tolerance
 
 data:
   output: ./output/wildgs_slam

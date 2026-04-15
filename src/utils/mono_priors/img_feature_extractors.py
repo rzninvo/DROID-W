@@ -27,16 +27,31 @@ class Fit3DModels(torch.nn.Module):
         return_class_token: bool = False,
         norm: bool = True,
     ):
-        outputs = self.model._intermediate_layers(x, n)
-        if norm:
-            outputs = [self.model.norm(out) for out in outputs]
-        if return_class_token:
-            prefix_tokens = [out[:, 0] for out in outputs]
+        # Two paths: legacy timm exposed `_intermediate_layers` returning
+        # full token sequences (prefix + patch) which we then split. timm
+        # 1.0+ removed that; the public `get_intermediate_layers` accepts
+        # `return_prefix_tokens=True` and returns tuples of (patch, prefix).
+        if hasattr(self.model, "_intermediate_layers"):
+            full = self.model._intermediate_layers(x, n)
+            if norm:
+                full = [self.model.norm(out) for out in full]
+            if return_class_token:
+                prefix_tokens = [out[:, 0] for out in full]
+            else:
+                prefix_tokens = [
+                    out[:, 0 : self.model.num_prefix_tokens] for out in full
+                ]
+            outputs = [out[:, self.model.num_prefix_tokens :] for out in full]
         else:
-            prefix_tokens = [
-                out[:, 0 : self.model.num_prefix_tokens] for out in outputs
-            ]
-        outputs = [out[:, self.model.num_prefix_tokens :] for out in outputs]
+            tuples = self.model.get_intermediate_layers(
+                x, n=n, reshape=False, return_prefix_tokens=True, norm=norm,
+            )
+            outputs = [pair[0] for pair in tuples]   # patch tokens
+            full_prefix = [pair[1] for pair in tuples]  # (B, num_prefix_tokens, C)
+            if return_class_token:
+                prefix_tokens = [pt[:, 0] for pt in full_prefix]
+            else:
+                prefix_tokens = full_prefix
 
         if reshape:
             B, C, H, W = x.shape

@@ -23,3 +23,11 @@ temp/
 
 Outputs/
 docs/
+FastSAM-s.pt
+mobileclip_blt.ts
+torch
+yoloe-v8s-seg.pt
+yolov8s-worldv2.pt
+thirdparty/diff-gaussian-rasterization-w-pose
+thirdparty/lietorch
+thirdparty/simple-knn

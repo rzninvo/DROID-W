@@ -678,8 +678,12 @@ def classify_tracks_by_uncertainty(
 
 def _pose_to_Rt(pose_7: np.ndarray) -> np.ndarray:
     """
-    Convert a DROID-SLAM pose (tx,ty,tz,qx,qy,qz,qw) to a 4x4 camera-to-world matrix.
-    Works for the (N,7) poses saved by DROID-W in video.npz.
+    Convert a DROID-SLAM pose (tx,ty,tz,qx,qy,qz,qw) to a 4x4 SE(3) matrix.
+
+    NOTE on convention: DROID-W's `tum_poses` in video.npz are stored as
+    **world-to-camera** (T_wc). This function just materializes the raw SE(3);
+    callers must invert to get camera-to-world if they need it.
+    See depth_video.py:56 and factor_graph.py for confirmation.
     """
     tx, ty, tz, qx, qy, qz, qw = pose_7
     n = qx*qx + qy*qy + qz*qz + qw*qw
@@ -705,7 +709,7 @@ def compute_reprojection_consistency(
     depths: np.ndarray,
     intrinsics: np.ndarray,
     sample_points: int = 100,
-    hit_threshold_px: int = 8,
+    hit_threshold_px: int = 15,
 ) -> Dict[int, float]:
     """
     Per-track mean reprojection hit-rate ∈ [0, 1]. Near 1.0 = static.
@@ -771,15 +775,17 @@ def compute_reprojection_consistency(
         X_cam = np.stack([(xs - cx) * d_a / fx, (ys - cy) * d_a / fy, d_a], axis=1)  # (M, 3)
         X_cam_h = np.concatenate([X_cam, np.ones((X_cam.shape[0], 1))], axis=1)       # (M, 4)
 
-        T_a_cw = _pose_to_Rt(poses[anchor_idx])                                       # cam->world
+        # tum_poses are **world-to-camera** in DROID-W. Invert the anchor pose
+        # to lift camera-frame points into world coordinates.
+        T_a_wc = _pose_to_Rt(poses[anchor_idx])                                       # world->cam (as stored)
+        T_a_cw = np.linalg.inv(T_a_wc)                                                # cam->world
         X_w = (T_a_cw @ X_cam_h.T).T[:, :3]                                           # world coords
 
         hits_total, total = 0, 0
         for f_idx, det in frames.items():
             if f_idx == anchor_idx:
                 continue
-            T_f_cw = _pose_to_Rt(poses[f_idx])
-            T_f_wc = np.linalg.inv(T_f_cw)                                            # world->cam
+            T_f_wc = _pose_to_Rt(poses[f_idx])                                        # world->cam directly
             X_f = (T_f_wc[:3, :3] @ X_w.T).T + T_f_wc[:3, 3]                          # (M, 3)
             z = X_f[:, 2]
             ok = z > 1e-3
@@ -821,14 +827,22 @@ def classify_tracks_logodds(
     all_detections: List[List[Dict]],
     reproj_hits: Optional[Dict[int, float]] = None,
     movability: Optional[Dict[str, float]] = None,
+    thing_stuff: Optional[Dict[str, str]] = None,
     threshold: float = 0.6,
     alpha: float = 1.0,
     beta: float = 1.0,
-    gamma: float = 1.0,
+    gamma: float = 0.5,
     unc_scale: Optional[float] = None,
     static_bias: float = 1.5,
     movability_floor: float = 0.7,
-    reproj_gate: float = 0.6,
+    reproj_gate: float = 0.4,
+    reproj_term_cap: float = 2.0,
+    min_frames_for_reproj: int = 4,
+    clip_margin_cutoff: float = 0.010,
+    clip_margin_full: float = 0.020,
+    compactness_thing_floor: float = 0.20,
+    min_frames_for_dynamic_thing: int = 4,
+    dino_trust_floor: float = 0.30,
 ) -> Dict[int, Dict]:
     """
     Conservative log-odds fusion. Defaults to STATIC; flips to dynamic only
@@ -856,14 +870,22 @@ def classify_tracks_logodds(
     """
     reproj_hits = reproj_hits or {}
     movability = movability or {}
+    thing_stuff = thing_stuff or {}
 
     frame_scores: Dict[int, List[float]] = {}
+    frame_clip_margins: Dict[int, List[float]] = {}
+    frame_compactness: Dict[int, List[float]] = {}
     for frame_dets in all_detections:
         for det in frame_dets:
             tid = det.get("track_id", -1)
-            if tid < 0 or "dynamic_confidence" not in det:
+            if tid < 0:
                 continue
-            frame_scores.setdefault(tid, []).append(float(det["dynamic_confidence"]))
+            if "dynamic_confidence" in det:
+                frame_scores.setdefault(tid, []).append(float(det["dynamic_confidence"]))
+            if "clip_margin" in det:
+                frame_clip_margins.setdefault(tid, []).append(float(det["clip_margin"]))
+            if "compactness" in det:
+                frame_compactness.setdefault(tid, []).append(float(det["compactness"]))
 
     if unc_scale is None or unc_scale <= 0:
         unc_scale = max(float(threshold), 1e-3)
@@ -875,6 +897,25 @@ def classify_tracks_logodds(
         label = t.get("label", "")
         p_mov = float(movability.get(label, 0.5))
         hit = float(reproj_hits.get(tid, 1.0))
+        num_frames = int(t.get("num_frames", 0))
+
+        # PRIMARY VETO 1: thing/stuff. A track whose label was classified by
+        # the VLM as "stuff" (vegetation, sky, ground, ...) can never receive
+        # the dynamic movability prior, regardless of its CLIP confidence.
+        # Direct attack on the bush-as-giraffe failure mode: even if CLIP
+        # mistakenly labels a bush as "giraffe", "giraffe" is a "thing" so
+        # this veto doesn't help — but if the VLM also discovered "vegetation"
+        # and it gets selected for some masks, those stay static. The
+        # complementary check is the compactness veto below.
+        ts_label = thing_stuff.get(label, "thing")
+
+        # PRIMARY VETO 2: compactness. "thing" labels (animal, person, car)
+        # require a compact mask (4π·area/perim² above floor). A sprawling
+        # mask labeled "giraffe" is almost always a vegetation mis-match.
+        compactness_vals = frame_compactness.get(tid, [])
+        mean_compactness = float(np.mean(compactness_vals)) if compactness_vals else 1.0
+        shape_veto_thing = (ts_label == "thing"
+                            and mean_compactness < compactness_thing_floor)
 
         scores = frame_scores.get(tid, [])
         if scores:
@@ -882,15 +923,77 @@ def classify_tracks_logodds(
         else:
             unc_ev = (t.get("mean_dynamic_confidence", 0.0) - threshold) / unc_scale
 
-        mov_term    = max(0.0, _logit(p_mov) - mov_floor_logit)
-        unc_term    = max(0.0, unc_ev)
-        reproj_term = max(0.0, _logit(1.0 - hit) - reproj_floor_logit)
+        # CLIP-margin modulator (scale-invariant confidence of the label
+        # assignment: top1 - top2 cosine similarity).
+        clip_margins = frame_clip_margins.get(tid, [])
+        mean_margin = float(np.mean(clip_margins)) if clip_margins else None
+        if mean_margin is None:
+            label_conf = 1.0   # non-mask-first backend, no margin → trust label
+        elif mean_margin >= clip_margin_full:
+            label_conf = 1.0
+        elif mean_margin <= clip_margin_cutoff:
+            label_conf = 0.0
+        else:
+            label_conf = ((mean_margin - clip_margin_cutoff)
+                          / max(1e-6, clip_margin_full - clip_margin_cutoff))
+
+        unc_term = max(0.0, unc_ev)
+
+        # Reprojection: noisy for small masks & short tracks. Cap + damp
+        # by label_conf so a weak-label track (mis-classified bush) can't
+        # push dynamic via geometry alone.
+        if num_frames < min_frames_for_reproj:
+            reproj_term = 0.0
+        else:
+            reproj_term = max(0.0, _logit(1.0 - hit) - reproj_floor_logit)
+            reproj_term = min(reproj_term, reproj_term_cap)
+            reproj_term = label_conf * reproj_term
+
+        # Movability prior: only fires when we have evidence — EITHER a
+        # confident CLIP label (real giraffe's margin is large) OR clear
+        # motion (real person walking has high uncertainty). A bush mis-
+        # labeled "giraffe" has neither, so the prior contributes 0 and the
+        # static bias wins. Uses DAMPED reproj_term so bushes' noisy
+        # geometry can't satisfy the motion clause.
+        motion_evidence = min(1.0, max(unc_term, reproj_term) / 0.3)
+        prior_gate = max(label_conf, motion_evidence)
+        conf_factor = prior_gate
+        mov_term = prior_gate * max(0.0, _logit(p_mov) - mov_floor_logit)
+
+        # Apply the four vetoes — they zero the dynamic prior even when
+        # label_conf or motion_evidence would have fired it.
+        # Veto 1: thing/stuff. "stuff" labels can never be dynamic.
+        if ts_label == "stuff":
+            mov_term = 0.0
+        # Veto 2: shape. Sprawling masks labeled as a "thing" are mis-matches.
+        if shape_veto_thing:
+            mov_term = 0.0
+        # Veto 3: persistence. Transient 2-3 frame tracks of high-movability
+        # classes are usually false positives.
+        if num_frames < min_frames_for_dynamic_thing:
+            mov_term = 0.0
+        # Veto 4: DINOv2 trust. If the second-opinion appearance check
+        # (mask-pooled DINO features, per-frame variance, distance to class
+        # prototype) gives low trust, the label assignment is likely wrong
+        # and we shouldn't fire the dynamic prior. Bushes mis-labeled as
+        # "giraffe" have wildly varying DINO embeddings across frames →
+        # dino_trust ≈ 0; real giraffes track tightly → dino_trust ≈ 1.
+        # Inactive when DINO features unavailable (`dino_trust is None`).
+        dino_trust = t.get("dino_trust", None)
+        if dino_trust is not None and dino_trust < dino_trust_floor:
+            mov_term = 0.0
 
         lo = -static_bias + alpha * mov_term + beta * unc_term + gamma * reproj_term
 
         t["p_movable"] = p_mov
         t["reproj_hit_rate"] = hit
         t["mean_unc_evidence"] = unc_ev
+        t["mean_clip_margin"] = mean_margin if mean_margin is not None else -1.0
+        t["mean_compactness"] = mean_compactness
+        t["thing_stuff"] = ts_label
+        t["shape_veto"] = shape_veto_thing
+        t["dino_veto"] = dino_trust is not None and dino_trust < dino_trust_floor
+        t["conf_factor"] = conf_factor
         t["mov_term"] = mov_term
         t["unc_term"] = unc_term
         t["reproj_term"] = reproj_term

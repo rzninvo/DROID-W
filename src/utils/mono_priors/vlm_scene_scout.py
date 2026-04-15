@@ -52,17 +52,37 @@ IGNORE_CLASSES = {
     "floor", "ceiling", "wall", "ground", "sky", "background",
     "shadow", "light", "air", "space", "none", "nothing", "road",
     "sidewalk", "pavement", "grass", "dirt", "concrete", "asphalt",
-    # Clothing (competes with "person" in YOLO-World)
-    "shirt", "tshirt", "t-shirt", "jacket", "coat", "pants", "jeans",
-    "shorts", "dress", "skirt", "hat", "cap", "helmet", "shoe", "shoes",
-    "boot", "boots", "sneakers", "hoodie", "sweater", "vest", "scarf",
-    "glove", "gloves", "sock", "socks", "mask", "glasses", "sunglasses",
+    # Clothing (competes with "person" in YOLO-World). Include singular forms
+    # too because the parser's plural-stripping turns "jeans" into "jean".
+    "shirt", "tshirt", "t-shirt", "jacket", "coat", "pants", "pant",
+    "jeans", "jean", "shorts", "short", "dress", "skirt", "hat", "cap",
+    "helmet", "shoe", "shoes", "boot", "boots", "sneakers", "sneaker",
+    "hoodie", "sweater", "vest", "scarf", "glove", "gloves", "sock",
+    "socks", "mask", "glasses", "sunglasses",
     # Body parts
     "hand", "hands", "arm", "arms", "leg", "legs", "head", "face",
     "foot", "feet", "hair", "finger", "fingers",
-    # Gendered/age variants — normalize to "person"
-    "man", "woman", "boy", "girl", "child", "kid", "baby",
-    "lady", "gentleman", "male", "female", "pedestrian",
+    # NOTE: gendered/age variants (man, woman, boy, girl, child, lady, etc.)
+    # are intentionally NOT filtered here — they are REMAPPED to "person" via
+    # CLASS_ALIASES below. Filtering them used to lose all humans when the
+    # VLM preferred specific terms over the generic "person".
+}
+
+# Alias map: whatever the VLM returns on the left gets rewritten to the canonical
+# name on the right before any filtering / dedup. This captures common synonyms
+# and gendered/age variants without losing the detection. (IGNORE_CLASSES is
+# applied AFTER this rewrite.)
+CLASS_ALIASES = {
+    # All humans → "person"
+    "man": "person", "woman": "person", "boy": "person", "girl": "person",
+    "child": "person", "kid": "person", "baby": "person", "toddler": "person",
+    "lady": "person", "gentleman": "person", "male": "person", "female": "person",
+    "pedestrian": "person", "human": "person", "people": "person",
+    "adult": "person", "teenager": "person", "guy": "person",
+    # Common synonyms (some also get merged by CLIP dedup, but this is faster+explicit)
+    "television": "tv", "tele": "tv",
+    "settee": "couch",
+    "trashcan": "trash can", "garbage can": "trash can", "bin": "trash can",
 }
 
 # Words that indicate an attribute description, not an object
@@ -79,20 +99,30 @@ ATTRIBUTE_WORDS = {
 # nouns ("computer monitor", "office chair") pushes embeddings apart so the
 # CLIP-similarity dedup pass needs to fire less often.
 DISCOVERY_PROMPT = (
-    "Analyze this image in two steps and reply ONLY with a JSON object.\n"
+    "Analyze this image and reply ONLY with a JSON object.\n"
     "Step 1 — In one short phrase, identify the scene type "
     '(e.g. "office", "kitchen", "outdoor street", "lecture hall").\n'
-    "Step 2 — List every distinct object you can see, using SPECIFIC compound "
-    "nouns when needed:\n"
-    '  - "computer monitor" not "monitor"\n'
-    '  - "office chair" not "chair"\n'
-    '  - "coffee mug" not "cup"\n'
-    '  - "desk lamp" not "lamp"\n'
-    "  - structural elements (door, window, radiator, vent, shelf)\n"
-    "  - small items (cable, photo frame, door handle, light switch, keyboard)\n"
-    "Be thorough — include partially visible items. Use lowercase nouns only "
-    "(no colors, sizes, or materials).\n"
-    'Reply EXACTLY in this JSON form, no extra text:\n'
+    "Step 2 — Exhaustively list EVERY distinct object you can see. "
+    "Aim for 20–40 objects. Check every corner of the image.\n"
+    "RULES:\n"
+    '  • Call every human "person". NEVER use "man", "woman", "boy", "girl", '
+    '"lady", "gentleman", "pedestrian" — use "person" for all of them.\n'
+    "  • Use SPECIFIC compound nouns to disambiguate similar categories:\n"
+    '      "computer monitor" (not "monitor" or "tv")\n'
+    '      "office chair"    (not "chair")\n'
+    '      "coffee mug"      (not "cup")\n'
+    '      "desk lamp"       (not "lamp")\n'
+    "  • Include ALL of these categories if visible:\n"
+    "      - furniture: chair, desk, table, shelf, cabinet, drawer, bookcase, bed, couch\n"
+    "      - electronics: monitor, laptop, keyboard, mouse, phone, speaker, camera, charger, router\n"
+    "      - containers: cup, mug, bottle, bowl, plate, jar, box, bag, backpack, basket, bin\n"
+    "      - stationery: book, notebook, paper, pen, pencil, marker, clipboard, folder, stapler\n"
+    "      - structural: door, window, wall socket, light switch, radiator, vent, pipe, beam\n"
+    "      - decor: plant, poster, painting, photo frame, clock, flag, sign\n"
+    "      - wires/cables, cords, headphones, and any tiny item on any surface\n"
+    "  • Lowercase common nouns only — no colors, sizes, materials, or adjectives.\n"
+    "  • Do NOT use vague phrases like 'items', 'objects', 'elements', 'things'.\n"
+    'Reply EXACTLY as JSON, no extra text:\n'
     '{"scene": "<scene type>", "objects": ["<obj1>", "<obj2>", ...]}'
 )
 
@@ -210,15 +240,64 @@ def parse_vlm_response(response: str) -> List[str]:
         response = response.replace('"', '').replace("'", "")
         raw_objects = re.split(r'[,\n]', response)
 
+    # Split entries that smuggled multiple items in via "/" (e.g. "wires/cables")
+    split_raw = []
+    for part in raw_objects:
+        s = str(part)
+        if "/" in s:
+            split_raw.extend(x.strip() for x in s.split("/") if x.strip())
+        else:
+            split_raw.append(s)
+    raw_objects = split_raw
+
     classes = []
     for part in raw_objects:
-        name = str(part).strip().lower().rstrip('.')
+        name = str(part).strip().lower().rstrip('.').rstrip(',').strip()
+
+        # If the VLM emits "structural elements (door, window)", pull out
+        # whatever is inside the parentheses as separate classes AND strip
+        # the outer phrase. Also handles "items (cable)" → ["cable"].
+        paren_match = re.search(r"\(([^)]+)\)", name)
+        if paren_match:
+            inner = paren_match.group(1)
+            # Drop the outer phrase; feed the inner items back through the loop.
+            inner_parts = [p.strip() for p in re.split(r"[,;/]", inner) if p.strip()]
+            raw_objects.extend(inner_parts)
+            # Also consider the name with the parenthetical removed
+            name = re.sub(r"\s*\([^)]+\)", "", name).strip()
+            if not name:
+                continue
+
         # Skip empty or overly long entries (VLM hallucination)
         if not name or len(name) >= 40 or len(name) <= 1:
             continue
 
+        # Skip JSON-syntax leakage (happens when VLM emits malformed JSON and
+        # the legacy parser then picks up keys as objects)
+        if any(tok in name for tok in (':', '{', '}', '[', ']')):
+            continue
+        if name.startswith(('scene', 'objects', 'name', 'type', 'label')) and ' ' not in name[:6]:
+            # "scene: office" or "objects" alone — JSON key, not an object
+            # But preserve genuine multi-word labels that start with these words
+            if name in ('scene', 'objects', 'name', 'type', 'label'):
+                continue
+
         # Don't accept the scene type as an object
         if scene_name and name == scene_name:
+            continue
+
+        # Don't accept vague/category-header echoes of the prompt.
+        PROMPT_ECHOES = {
+            # Generic
+            "structural elements", "small items", "large objects", "small objects",
+            "items", "item", "elements", "element", "things", "thing", "objects",
+            "object", "stuff", "tiny item", "tiny items",
+            # Category headers we list in the prompt that the VLM sometimes
+            # regurgitates as entries of their own.
+            "furniture", "electronics", "containers", "container",
+            "stationery", "structural", "decor", "decoration", "decorations",
+        }
+        if name in PROMPT_ECHOES:
             continue
 
         # Strip attribute words (e.g., "blue tshirt" → "tshirt"). Compound
@@ -231,6 +310,31 @@ def parse_vlm_response(response: str) -> List[str]:
         if not name:
             continue
 
+        # Conservative singularization — strip trailing 's' on the head noun
+        # when the remainder is a clearly valid singular form. Avoid false
+        # positives like "glass"→"glas" by keeping a stop-list. Applied to
+        # the LAST word only (so "photo frames" → "photo frame").
+        STOP_SINGULARIZE = {
+            "glass", "class", "dress", "press", "bus", "this", "lens",
+            "cross", "plus", "canvas",
+        }
+        parts = name.split()
+        if parts:
+            tail = parts[-1]
+            if (len(tail) >= 4 and tail.endswith("s") and not tail.endswith("ss")
+                    and tail not in STOP_SINGULARIZE):
+                # 'es' suffix: boxes→box, brushes→brush, watches→watch
+                if tail.endswith("es") and tail[-3] in "xs" or tail.endswith("ches") or tail.endswith("shes"):
+                    parts[-1] = tail[:-2]
+                else:
+                    parts[-1] = tail[:-1]
+                name = " ".join(parts)
+
+        # Remap synonyms / gendered terms to canonical names BEFORE filtering
+        # (e.g. "man" → "person", "television" → "tv"). This is why people
+        # are preserved even when the VLM prefers gendered words.
+        name = CLASS_ALIASES.get(name, name)
+
         # Skip if the cleaned name is in IGNORE_CLASSES
         if name in IGNORE_CLASSES:
             continue
@@ -241,7 +345,13 @@ def parse_vlm_response(response: str) -> List[str]:
 
         classes.append(name)
 
-    return classes
+    # Deduplicate while preserving order
+    seen, out = set(), []
+    for c in classes:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 class VLMSceneScout:
@@ -270,9 +380,12 @@ class VLMSceneScout:
         self.use_default_seed = vlm_cfg.get("use_default_seed", False)
 
         # CLIP-similarity vocabulary deduplication ("tv" ≈ "monitor", ...)
-        # Default 0.85: ConceptGraphs uses 0.8, HOV-SG uses 0.85–0.9.
-        # 0.85 catches "tv"≈"monitor" / "couch"≈"sofa" without over-collapsing.
-        self.dedupe_clip_threshold = vlm_cfg.get("dedupe_clip_threshold", 0.85)
+        # Default 0.90: calibrated on ViT-B-32 with real office-scene classes.
+        # At 0.85 unrelated items collide ("book"-"shelf"=0.867, "window"-"door"=0.880).
+        # At 0.90 only true synonyms merge (tv-monitor=0.902, couch-sofa=0.915,
+        # computer-monitor-monitor=0.933). ConceptGraphs uses 0.8 on ViT-H-14
+        # which has tighter embeddings — our ViT-B-32 needs a stricter threshold.
+        self.dedupe_clip_threshold = vlm_cfg.get("dedupe_clip_threshold", 0.90)
         self.dedupe_clip_model = vlm_cfg.get("dedupe_clip_model", "ViT-B-32")
         self._clip_dedup = None  # lazy-loaded (model, tokenizer) tuple
 
@@ -281,12 +394,16 @@ class VLMSceneScout:
 
         # Thread-safe class storage. Seed only if explicitly requested or if
         # VLM discovery is disabled (otherwise we'd fight the VLM's choices).
+        # Even without the seed, we guarantee "person" is present — this is
+        # a critical safety class for any scene and can silently fail to be
+        # discovered if the VLM prefers gendered terms that don't survive
+        # parsing in older configs.
         self._lock = threading.Lock()
         if self.use_default_seed or not self.enabled:
             from src.utils.mono_priors.seg_model import DEFAULT_CLASSES
             self._classes: Set[str] = {c.lower() for c in DEFAULT_CLASSES}
         else:
-            self._classes: Set[str] = set()
+            self._classes: Set[str] = {"person"}
         self._classes_changed = True
         self._class_list_version = 1
 
@@ -333,10 +450,18 @@ class VLMSceneScout:
                     self._classes.add(cls)
                     new_classes.append(cls)
             if new_classes:
+                had_person = "person" in self._classes
                 # CLIP-merge any near-duplicates introduced by this batch
                 # (e.g. discovered "monitor" while seed already had "computer
                 # monitor"). Keeps the canonical name per cluster.
                 deduped = set(self.dedupe_classes(sorted(self._classes)))
+                # Safety: "person" must stay in the vocabulary once it's
+                # been added. Dedup has been observed to transiently merge
+                # it into a multi-word neighbour ("jean", "laptop", ...)
+                # during early rounds and then never restore it. Missing
+                # "person" breaks dynamic-object SLAM downstream.
+                if had_person:
+                    deduped.add("person")
                 if deduped != self._classes:
                     self._classes = deduped
                 self._classes_changed = True
@@ -560,9 +685,12 @@ class VLMSceneScout:
             listing = "\n".join(f"- {c}" for c in chunk)
             prompt = (
                 "For each object class below, output a movability score from 0.0 to 1.0.\n"
-                "0.0 = permanently fixed (wall, floor, ceiling).\n"
-                "0.5 = can be moved by a person (chair, cup, laptop).\n"
-                "1.0 = moves on its own (person, car, dog, bicycle).\n"
+                "0.0 = permanently fixed (wall, floor, ceiling, building, pipe, mountain).\n"
+                "0.5 = can be moved by a person (chair, cup, laptop, book, bag, box).\n"
+                "1.0 = moves on its own — ALL animals and ALL vehicles "
+                "(person, car, bicycle, dog, cat, horse, cow, sheep, bird, elephant, "
+                "giraffe, zebra, lion, monkey, fish, deer, bear, motorcycle, bus, train, plane, balloon).\n"
+                "When in doubt for an animal or vehicle, choose 1.0.\n"
                 "Reply with exactly one line per class in the form:\n"
                 "  class: score\n"
                 "No extra text. Here are the classes:\n"
@@ -614,6 +742,88 @@ class VLMSceneScout:
     def load_movability(output_dir: str) -> Optional[dict]:
         """Load per-class movability scores; returns None if not present."""
         path = os.path.join(output_dir, "vlm_movability.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    def classify_thing_stuff(self, classes: List[str], batch_size: int = 80) -> dict:
+        """
+        For each discovered class, label it as "thing" or "stuff" via the VLM:
+            thing = countable, bounded object  (person, car, mug, giraffe, elephant)
+            stuff = amorphous region with no instance boundary
+                    (sky, vegetation, grass, ground, water, road, wall, floor, ceiling)
+
+        Used downstream as a hard veto: a track whose label is "stuff" never
+        receives the dynamic movability prior. This kills the bush-as-giraffe
+        false positive at the source — vegetation can never be a giraffe.
+
+        One batched VLM call per run, cached on disk as vlm_thing_stuff.json.
+        """
+        import re
+        if not classes:
+            return {}
+        self._ensure_loaded()
+        result: dict = {}
+
+        for start in range(0, len(classes), batch_size):
+            chunk = classes[start:start + batch_size]
+            listing = "\n".join(f"- {c}" for c in chunk)
+            prompt = (
+                "For each object class below, output exactly 'thing' or 'stuff'.\n"
+                "  thing = a countable, bounded object you could point at and say 'one of those' "
+                "(person, car, chair, mug, monitor, giraffe, elephant, bottle, lamp).\n"
+                "  stuff = an amorphous region with no clear instance boundary "
+                "(sky, vegetation, grass, ground, water, road, wall, floor, ceiling, "
+                "rocks, sand, snow, foliage, dirt, clouds).\n"
+                "When in doubt, prefer 'thing' for any class that could be a single object.\n"
+                "Reply with exactly one line per class in the form:\n"
+                "  class: thing\n"
+                "  class: stuff\n"
+                "No extra text. Here are the classes:\n"
+                f"{listing}"
+            )
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            text_input = self._processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self._processor(
+                text=[text_input], return_tensors="pt", padding=True
+            ).to(self.device)
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+            generated = output_ids[0, inputs.input_ids.shape[1]:]
+            response = self._processor.tokenizer.decode(generated, skip_special_tokens=True)
+
+            for line in response.splitlines():
+                m = re.match(r"\s*[-*•\d\.\)]*\s*(.+?)\s*[:\-]\s*(thing|stuff)\b", line, re.IGNORECASE)
+                if not m:
+                    continue
+                name = m.group(1).strip().lower().rstrip(".")
+                kind = m.group(2).strip().lower()
+                if name in chunk:
+                    result[name] = kind
+
+        # Default any missing classes to 'thing' (safer — they get classified
+        # normally by the rest of the pipeline)
+        for c in classes:
+            result.setdefault(c, "thing")
+        logger.info(f"Classified thing/stuff for {len(classes)} classes "
+                    f"({sum(1 for v in result.values() if v == 'stuff')} stuff)")
+        return result
+
+    def save_thing_stuff(self, output_dir: str, thing_stuff: dict):
+        """Save per-class thing/stuff labels for post-processing reuse."""
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "vlm_thing_stuff.json")
+        with open(path, "w") as f:
+            json.dump(thing_stuff, f, indent=2)
+        logger.info(f"Saved thing/stuff for {len(thing_stuff)} classes to {path}")
+
+    @staticmethod
+    def load_thing_stuff(output_dir: str) -> Optional[dict]:
+        """Load per-class thing/stuff labels; returns None if not present."""
+        path = os.path.join(output_dir, "vlm_thing_stuff.json")
         if not os.path.exists(path):
             return None
         with open(path) as f:
