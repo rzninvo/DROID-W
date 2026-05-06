@@ -375,11 +375,6 @@ class RADSegEncoder(ImageSemSegEncoder):
         # downstream ignore_label step thresholds against the correct
         # values (the variable from before refinement is now stale).
         max_sim_per_pixel = seg_probs.amax(dim=1, keepdim=True)
-        # Bump prediction_thresh slightly — without this the default 0.0
-        # lets pixels where SAM-3 returned all-zero scores keep their
-        # arbitrary argmax instead of becoming the ignore class.
-        if self.prediction_thresh <= 0.0:
-          self.prediction_thresh = 0.05
       else:
         seg_pred_ref = list()
         seg_probs_ref = list()
@@ -406,10 +401,17 @@ class RADSegEncoder(ImageSemSegEncoder):
         seg_pred = torch.stack(seg_pred_ref, dim=0)
         seg_probs = torch.stack(seg_probs_ref, dim=0)
 
-    # Set low confidence predictions to the ignore label
+    # Set low confidence predictions to the ignore label.
+    # Local-only threshold (does NOT mutate self.prediction_thresh — would
+    # leak across calls per reviewer C MUST-FIX). The SAM-3 path needs a
+    # small positive value so pixels where SAM-3 returned all-zero scores
+    # become the ignore class instead of an arbitrary argmax+1.
+    _pred_thresh = self.prediction_thresh
+    if self.sam_refinement and getattr(self, "sam3", False) and _pred_thresh <= 0.0:
+      _pred_thresh = 0.05
     if ignore_label:
       seg_pred += 1
-      seg_pred[max_sim_per_pixel < self.prediction_thresh] = 0
+      seg_pred[max_sim_per_pixel < _pred_thresh] = 0
       seg_probs = torch.cat(
         [torch.zeros_like(seg_probs[:, :1, :, :]), seg_probs], dim=1)
     if return_preds:

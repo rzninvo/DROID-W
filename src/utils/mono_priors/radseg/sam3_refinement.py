@@ -40,13 +40,15 @@ def sam3_refinement(
     sam3_model,
     sam3_processor,
     device: str = "cuda:0",
-    score_threshold: float = 0.5,
+    score_threshold: float = 0.7,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run SAM-3 per-query, union instance masks → (seg_probs, seg_pred).
 
     Notes on the score field. SAM-3's `post_process_instance_segmentation`
     returns binary instance masks plus per-instance scores. We:
-      • keep instances whose score >= score_threshold (default 0.5)
+      • keep instances whose score >= score_threshold (default 0.7 —
+        empirically tuned on freiburg3_walking_static; lower values
+        admit bleedy low-confidence 'wall' instances)
       • union them for that query
       • use the score-weighted soft-union as the per-pixel "probability"
         so the downstream code that reads seg_probs[c, h, w] still gets a
@@ -77,11 +79,14 @@ def sam3_refinement(
         if masks is None or masks.numel() == 0:
             continue
         scores = results.get("scores")
-        masks_f = masks.to(device=device, dtype=torch.float32)
+        # Device-safe conversion order (reviewer C SHOULD-FIX): cast to float
+        # then move to compute device. post_process_instance_segmentation
+        # doesn't guarantee its output device matches `device`.
+        masks_f = masks.float().to(device)
         if scores is not None and scores.numel() == masks_f.shape[0]:
-            scores_f = scores.to(device=device, dtype=torch.float32).clamp(0, 1)
+            scores_f = scores.float().to(device).clamp(0, 1).view(-1, 1, 1)
             # Score-weighted union: out[h,w] = max_i (s_i * mask_i[h,w]).
-            weighted = masks_f * scores_f.view(-1, 1, 1)
+            weighted = masks_f * scores_f
             sem = weighted.amax(dim=0)
         else:
             sem = (masks_f.sum(dim=0) > 0).float()
