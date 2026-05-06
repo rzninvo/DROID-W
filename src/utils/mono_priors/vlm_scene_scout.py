@@ -43,6 +43,29 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _as_feature_tensor(out) -> torch.Tensor:
+    """Coerce HF / OpenCLIP encoder outputs to a (B, D) feature tensor.
+
+    transformers 5.x sometimes returns BaseModelOutputWithPooling from
+    Siglip2Model.get_{text,image}_features instead of a bare tensor. Pick
+    the pooled / image-embeds field when available, fall back to last
+    hidden state mean-pool, else raise.
+    """
+    if torch.is_tensor(out):
+        return out
+    for attr in ("image_embeds", "text_embeds", "pooler_output"):
+        if hasattr(out, attr) and getattr(out, attr) is not None:
+            t = getattr(out, attr)
+            if torch.is_tensor(t):
+                return t
+    if hasattr(out, "last_hidden_state") and torch.is_tensor(out.last_hidden_state):
+        # Mean-pool over the sequence dim as a last resort.
+        return out.last_hidden_state.mean(dim=1)
+    raise RuntimeError(
+        f"[vlm_scout] unexpected encoder output type: {type(out).__name__}"
+    )
+
+
 # Fallback classes if VLM fails or is disabled — minimal seed list
 SEED_CLASSES = ["person", "car", "chair", "table", "door"]
 
@@ -549,6 +572,7 @@ class VLMSceneScout:
                 return None
             tokens = tokenizer(list(classes)).to(self.device)
             emb = model.encode_text(tokens)
+        emb = _as_feature_tensor(emb)
         return emb / emb.norm(dim=-1, keepdim=True)
 
     def dedupe_classes(

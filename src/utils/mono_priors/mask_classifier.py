@@ -22,6 +22,27 @@ import cv2
 import torch
 
 
+def _as_feature_tensor(out) -> torch.Tensor:
+    """Coerce HF / OpenCLIP encoder outputs to a (B, D) feature tensor.
+
+    transformers 5.x's Siglip2Model.get_{text,image}_features can return
+    BaseModelOutputWithPooling. Pick the pooled / embeds field; fall back
+    to last hidden state mean-pool, else raise.
+    """
+    if torch.is_tensor(out):
+        return out
+    for attr in ("image_embeds", "text_embeds", "pooler_output"):
+        if hasattr(out, attr) and getattr(out, attr) is not None:
+            t = getattr(out, attr)
+            if torch.is_tensor(t):
+                return t
+    if hasattr(out, "last_hidden_state") and torch.is_tensor(out.last_hidden_state):
+        return out.last_hidden_state.mean(dim=1)
+    raise RuntimeError(
+        f"[mask_classifier] unexpected encoder output type: {type(out).__name__}"
+    )
+
+
 class MaskClassifier:
     """FastSAM segment-everything + per-mask open-vocab classification.
 
@@ -122,6 +143,7 @@ class MaskClassifier:
         else:
             tokens = self._tokenizer(prompts).to(self.device)
             emb = self._encoder.encode_text(tokens)
+        emb = _as_feature_tensor(emb)
         emb = emb / emb.norm(dim=-1, keepdim=True)
         return emb
 
@@ -133,6 +155,7 @@ class MaskClassifier:
             emb = self._encoder.get_image_features(pixel_values=batch)
         else:
             emb = self._encoder.encode_image(batch)
+        emb = _as_feature_tensor(emb)
         emb = emb / emb.norm(dim=-1, keepdim=True)
         return emb
 
