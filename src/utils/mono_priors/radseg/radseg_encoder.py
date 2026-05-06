@@ -243,8 +243,15 @@ class RADSegEncoder(ImageSemSegEncoder):
       self.sam_mask_coff = sam_mask_coff
       self.sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(device=self.device).eval()
       self.sam_predictor = SamPredictor(self.sam)
-      del self.sam.image_encoder.blocks
-      del self.sam.image_encoder.patch_embed
+      # PATCH (HERMES-SLAM): only delete SAM's image_encoder when we plan to
+      # inject RADIO features (v3 path with `sam` adaptor producing 1280-ch
+      # features). Under v4 (sam3=True) SAM-1's neck would receive 1024-ch
+      # features which crashes the forward; instead we keep the full SAM-1
+      # ViT-H encoder and feed the raw image through SAM's standard pipeline
+      # — see the if/else split in encode_image_to_feat_map below.
+      if not self.sam3:
+        del self.sam.image_encoder.blocks
+        del self.sam.image_encoder.patch_embed
       torch.cuda.empty_cache()
 
   @property
@@ -333,21 +340,32 @@ class RADSegEncoder(ImageSemSegEncoder):
       seg_pred_ref = list()
       seg_probs_ref = list()
       for b in range(B):
-        sam_image, new_h, new_w = self._preprocess_sam(rgb_image[b], target_size=1024)
-        image_features = self._single_inference(sam_image)
-        sam_features = self._get_sam_spatial_features(image_features).float()
-        sam_features = self._interpolate_to_sam_dims(sam_features)
-        sam_features = self.sam_predictor.model.image_encoder.neck(sam_features)
-        self.sam_predictor.features = sam_features
-        self.sam_predictor.is_image_set = True
-        self.sam_predictor.original_size = orig_img_size
-        self.sam_predictor.input_size = (new_h, new_w)
-        
+        if self.sam3:
+          # PATCH (HERMES-SLAM): v4 'sam3' adaptor outputs 1024-ch features
+          # which are incompatible with SAM-1 ViT-H's 1280-ch neck. Run SAM-1
+          # on the raw image with its STANDARD pipeline (full ViT-H encoder)
+          # instead of injecting RADIO features.
+          img_np = (rgb_image[b].permute(1, 2, 0).clamp(0, 1) * 255.0
+                    ).detach().cpu().numpy().astype('uint8')
+          self.sam_predictor.set_image(img_np)
+        else:
+          # Original v3 path: inject RADIO 'sam' adaptor features into SAM-1's
+          # neck. Saves a SAM ViT-H forward pass.
+          sam_image, new_h, new_w = self._preprocess_sam(rgb_image[b], target_size=1024)
+          image_features = self._single_inference(sam_image)
+          sam_features = self._get_sam_spatial_features(image_features).float()
+          sam_features = self._interpolate_to_sam_dims(sam_features)
+          sam_features = self.sam_predictor.model.image_encoder.neck(sam_features)
+          self.sam_predictor.features = sam_features
+          self.sam_predictor.is_image_set = True
+          self.sam_predictor.original_size = orig_img_size
+          self.sam_predictor.input_size = (new_h, new_w)
+
         refined_masks, scores, refined_logits, prompt_boxes = sam_refinement(
           orig_img_size, seg_pred[b], seg_probs[b], num_cls, self.sam_predictor,
           self.coarse_thresh, self.minimal_area,
           self.sam_mask_coff, self.sam_iou_thresh)
-      
+
         seg_pred_ref.append(refined_masks)
         seg_probs_ref.append(refined_logits)
       seg_pred = torch.stack(seg_pred_ref, dim=0)

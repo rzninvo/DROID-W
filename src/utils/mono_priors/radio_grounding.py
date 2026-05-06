@@ -86,28 +86,15 @@ class RadioGrounder:
         if sam3 is None:
             sam3 = is_v4
 
-        # SAM refinement compatibility check.
-        # Upstream radseg_encoder.py wires the RADIO sam-adaptor output straight
-        # into SAM's image_encoder.neck. The neck dim is set by the SAM weights:
-        #   SAM-1 ViT-H (sam_vit_h_4b8939.pth):  expects 1280-channel input.
-        # The RADIO adaptor output dims are:
-        #   v3-b 'sam' adaptor:   1280 ✓ (matches SAM-1 neck)
-        #   v4 'sam3' adaptor:    1024 ✗ (would need SAM-3 weights; SAM-3 has
-        #                                  not been integrated upstream yet).
-        # We can't silently load SAM-1 with v4 — it crashes the forward pass.
-        if sam_refinement and bool(sam3):
-            print(
-                "[WARN] radio_grounding: sam_refinement requested with the v4 "
-                "'sam3' adaptor; expected=SAM-3 weights with 1024-channel neck, "
-                "got=SAM-1 ViT-H ('sam_vit_h_4b8939.pth') with 1280-channel neck, "
-                "fallback=disable SAM refinement (RADIO grounding still runs). "
-                "Pass --radio-version=c-radio_v3-b to keep SAM-1 refinement, "
-                "or supply SAM-3 weights once they're publicly released.",
-                flush=True,
-            )
-            sam_refinement = False
-            self._sam_refinement = False
-            self._sam_ckpt = None
+        # SAM refinement compatibility note.
+        # v3-b's 'sam' adaptor outputs 1280-ch features which match SAM-1's
+        # 1280-channel neck — feature injection works (upstream's default).
+        # v4's 'sam3' adaptor outputs 1024-ch features and would crash SAM-1's
+        # 1280-ch neck if injected. The vendored radseg_encoder.py is patched
+        # to take a separate code path under sam3=True: run SAM-1's full ViT-H
+        # encoder on the raw image (its standard pipeline), and refine RADIO's
+        # masks via the resulting SamPredictor. Costs one extra SAM ViT-H
+        # forward per keyframe but keeps mask refinement working under v4.
 
         self._encoder: Optional[RADSegEncoder] = None
         self._encoder_kwargs = dict(
