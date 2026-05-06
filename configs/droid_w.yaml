@@ -172,7 +172,11 @@ vlm_scout:
   max_classes: 300              # cap on total discovered classes (raised for cluttered scenes)
   device: 'cuda:0'              # device for VLM inference (can differ from SLAM device)
   use_default_seed: False       # SOTA: discover entirely from VLM (no hardcoded COCO seed)
-  dedupe_clip_threshold: 0.90   # cosine sim ≥ this → merge classes. Calibrated on ViT-B-32 (tv-monitor=0.902, couch-sofa=0.915). For SigLIP 2 the cosine distribution is tighter — start at 0.80 and tune.
+  dedupe_clip_threshold: 0.90   # cosine sim ≥ this → merge classes. Per-encoder calibration:
+                                #   ViT-B-32 (CLIP): 0.90  — tv/monitor=0.93, couch/sofa=0.92
+                                #   siglip2-large-256: 0.91 — its text cosines are tighter (median 0.82, max 0.95);
+                                #     0.91 merges monitor/computer-monitor (0.95), chair/office-chair (0.92),
+                                #     desk/table (0.91), mug/coffee-mug (0.93). Below 0.85 it over-merges.
   dedupe_clip_model: 'ViT-B-32' # OpenCLIP variant (used when dedupe_text_encoder=='clip')
   dedupe_text_encoder: 'clip'   # 'clip' | 'siglip2' — must match mask_classifier.encoder for shared embedding space
   dedupe_siglip2_model: 'google/siglip2-large-patch16-256'  # used when dedupe_text_encoder=='siglip2'
@@ -196,7 +200,11 @@ detector:
   encoder: 'clip'               # 'clip' | 'siglip2' — image-text encoder for per-mask classification
   clip_model: 'ViT-B-32'        # OpenCLIP backbone (used when encoder=='clip')
   siglip2_model: 'google/siglip2-large-patch16-256'  # used when encoder=='siglip2'; requires transformers>=4.49
-  accept_thresh: 0.23           # min cosine sim to accept a label. CLIP ViT-B-32: 0.23. SigLIP 2 cosines are higher — start ~0.30 and tune.
+  accept_thresh: 0.23           # min cosine sim to accept a label. Per-encoder calibration on freiburg3_walking_static FastSAM masks:
+                                #   ViT-B-32 (CLIP):   0.23 (positives ≈ 0.25–0.35)
+                                #   siglip2-large-256: 0.11 (positives ≈ 0.10–0.14, median 0.10)
+                                # SigLIP 2 cosines are much TIGHTER than CLIP because the model
+                                # is trained with sigmoid loss; raw cosine post-L2 is ~0.5× CLIP's.
   mask_iou_dedup: 0.55          # mask-IoU above this → suppress duplicate (was 0.65 — too lax)
   containment_thresh: 0.60      # if sub_mask is this fraction inside a larger kept mask → drop it. Kills "poster with text/photo inside" over-segmentation
   min_mask_area: 20             # drop noise masks smaller than this many pixels
