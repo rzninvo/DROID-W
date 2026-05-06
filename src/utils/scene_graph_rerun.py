@@ -252,37 +252,40 @@ def stream_scene_graph(
 
     frustum_local = _camera_frustum(scale=frustum_scale)  # (S, 2, 3)
 
-    # Per-keyframe logging
+    # Per-keyframe logging — TWO parallel entity trees:
+    #   world/slam/<kf>          → DROID-W-style RGB-colored cloud + cameras
+    #   world/scene_graph/<kf>   → instance-id-colored cloud + dynamic-red highlight
+    # Toggle visibility in the rerun viewer's entity panel to switch views.
     for kf in range(N):
         try:
             rr.set_time_sequence("keyframe", kf)
         except Exception:
             pass
         T_w_c = _pose_to_world_from_cam(poses[kf])  # 4x4 cam-to-world
-        cam_path = f"world/cameras/{kf:06d}"
 
-        # Pose
-        try:
-            rr.log(
-                cam_path,
-                rr.Transform3D(
-                    translation=T_w_c[:3, 3].astype(np.float32),
-                    mat3x3=T_w_c[:3, :3].astype(np.float32),
-                ),
-            )
-        except Exception:
-            pass
-
-        # Frustum lines (transform local segments into world)
-        try:
-            segs_world = []
-            for seg in frustum_local:
-                seg_h = np.concatenate([seg, np.ones((2, 1), dtype=np.float32)], axis=1)
-                seg_w = (T_w_c @ seg_h.T).T[:, :3]
-                segs_world.append(seg_w)
-            rr.log(f"{cam_path}/frustum", rr.LineStrips3D(np.stack(segs_world, axis=0)))
-        except Exception:
-            pass
+        # Cameras + frustum (under both trees so each view can be inspected
+        # independently). Logging twice is cheap — they're tiny entities.
+        for prefix in ("world/slam", "world/scene_graph"):
+            cam_path = f"{prefix}/cameras/{kf:06d}"
+            try:
+                rr.log(
+                    cam_path,
+                    rr.Transform3D(
+                        translation=T_w_c[:3, 3].astype(np.float32),
+                        mat3x3=T_w_c[:3, :3].astype(np.float32),
+                    ),
+                )
+            except Exception:
+                pass
+            try:
+                segs_world = []
+                for seg in frustum_local:
+                    seg_h = np.concatenate([seg, np.ones((2, 1), dtype=np.float32)], axis=1)
+                    seg_w = (T_w_c @ seg_h.T).T[:, :3]
+                    segs_world.append(seg_w)
+                rr.log(f"{cam_path}/frustum", rr.LineStrips3D(np.stack(segs_world, axis=0)))
+            except Exception:
+                pass
 
         # Build per-pixel instance + dynamic maps
         dets = all_detections[kf] if kf < len(all_detections) else []
@@ -298,7 +301,7 @@ def stream_scene_graph(
         ).reshape(-1, 4)
         world_xyz = (T_w_c @ cam_xyz_h.T).T[:, :3]
 
-        # Sample masks at the same subsampled grid
+        # Sample masks + RGB at the same subsampled grid
         inst_grid = inst_map[vs, us]
         dyn_grid = dyn_map[vs, us]
         rgb_grid = imgs_u8[kf][vs, us]                       # (h, w, 3)
@@ -312,14 +315,20 @@ def stream_scene_graph(
         valid_flat = valid.reshape(-1)
         if not valid_flat.any():
             continue
-        pts = world_xyz[valid_flat]
+        pts = world_xyz[valid_flat].astype(np.float32)
         inst_flat = inst_grid.reshape(-1)[valid_flat]
         dyn_flat = dyn_grid.reshape(-1)[valid_flat]
-        rgb_flat = rgb_grid.reshape(-1, 3)[valid_flat].astype(np.uint8)
+        rgb_full = rgb_grid.reshape(-1, 3)[valid_flat].astype(np.uint8)
 
-        # Compute per-point colour
-        colors = (rgb_flat.astype(np.float32) * UNMASKED_RGB_DIM).astype(np.uint8)
-        # Instance-coloured pixels (replace dim RGB with track colour)
+        # SLAM view: full-saturation RGB (matches DROID-W's live stream)
+        try:
+            rr.log(f"world/slam/points/{kf:06d}",
+                   rr.Points3D(pts, colors=rgb_full))
+        except Exception:
+            pass
+
+        # Scene-graph view: instance-id colours + dynamic-red overlay
+        sg_colors = (rgb_full.astype(np.float32) * UNMASKED_RGB_DIM).astype(np.uint8)
         instanced = inst_flat >= 0
         if instanced.any():
             unique_ids = np.unique(inst_flat[instanced])
@@ -327,18 +336,14 @@ def stream_scene_graph(
                 if tid < 0:
                     continue
                 sel = inst_flat == tid
-                colors[sel] = _track_color(int(tid))
-        # Dynamic pixels overwrite to red
+                sg_colors[sel] = _track_color(int(tid))
         if dyn_flat.any():
-            colors[dyn_flat] = DYNAMIC_RGB
-
+            sg_colors[dyn_flat] = DYNAMIC_RGB
         try:
-            rr.log(f"world/points/{kf:06d}", rr.Points3D(pts.astype(np.float32), colors=colors))
+            rr.log(f"world/scene_graph/points/{kf:06d}",
+                   rr.Points3D(pts, colors=sg_colors))
         except Exception:
-            try:
-                rr.log(f"world/points/{kf:06d}", rr.Points3D(pts.astype(np.float32)))
-            except Exception:
-                pass
+            pass
 
     # Flush so callers that stat() the .rrd right after this returns see the
     # real size (rerun otherwise relies on its atexit hook).
