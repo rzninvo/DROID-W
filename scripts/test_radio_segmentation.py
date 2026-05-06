@@ -120,8 +120,12 @@ def main() -> int:
                    help="Output dir (default: <scene>/radio_seg).")
     p.add_argument("--fps", type=int, default=5)
     p.add_argument("--device", type=str, default="cuda:0")
-    p.add_argument("--radio-version", type=str, default="c-radio_v3-b")
-    p.add_argument("--lang-adaptor", type=str, default="siglip2")
+    p.add_argument("--radio-version", type=str, default="c-radio_v4-h",
+                   help="RADIO checkpoint version ('c-radio_v4-h' default, "
+                        "'c-radio_v4-so400m' lighter, 'c-radio_v3-b' legacy).")
+    p.add_argument("--lang-adaptor", type=str, default=None,
+                   help="Lang adaptor name; auto-detected from --radio-version "
+                        "(v3 → 'siglip2', v4 → 'siglip2-g'). Override if needed.")
     p.add_argument("--max-keyframes", type=int, default=None,
                    help="Optional cap on keyframes (debug).")
     args = p.parse_args()
@@ -162,15 +166,10 @@ def main() -> int:
     Q = len(args.queries)
     colours = [_PALETTE_BGR[i % len(_PALETTE_BGR)] for i in range(Q)]
 
-    # Open per-query writers + a combined writer
+    # Open the combined writer only — per-query .mp4s deliberately dropped
+    # (one .mp4 per query bloated outputs without adding signal beyond what
+    # combined.mp4 already shows via argmax-over-queries colouring).
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    per_q_writers = []
-    for q in args.queries:
-        safe = q.replace(" ", "_").replace("/", "_")
-        path = out_dir / f"{safe}.mp4"
-        if path.exists():
-            path.unlink()
-        per_q_writers.append((path, cv2.VideoWriter(str(path), fourcc, args.fps, (W, H))))
     combined_path = out_dir / "combined.mp4"
     if combined_path.exists():
         combined_path.unlink()
@@ -189,25 +188,21 @@ def main() -> int:
         rgb = images[i].transpose(1, 2, 0)  # (H, W, 3) uint8 RGB
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         result = grounder.segment(rgb)
-        score = result[score_field]   # (Q, H, W)
+        score = result[score_field]   # (Q, H, W) — kept for stats
 
-        # Per-query writer with that query's binary mask + colour
+        # Per-query stats (no per-query .mp4 — combined.mp4 only)
         for qi in range(Q):
             mask_q = score[qi] >= args.threshold
             per_q_pixels[qi] += int(mask_q.sum())
             score_min[qi] = min(score_min[qi], float(score[qi].min()))
             score_max[qi] = max(score_max[qi], float(score[qi].max()))
-            frame = _overlay_mask(bgr, mask_q, colours[qi])
-            frame = _draw_legend(frame, [args.queries[qi]], [colours[qi]], i, N)
-            per_q_writers[qi][1].write(frame)
 
-        # Combined: each pixel takes the winning query (argmax over queries
-        # in softmax space), but only if best_score (softmax probability of
-        # the winning query) is above threshold. Pixels below threshold for
-        # all queries stay un-coloured.
+        # Combined: each pixel takes the winning query (argmax) iff
+        # best_score >= threshold. Pixels below threshold for all queries
+        # stay un-coloured.
         combined = bgr.copy()
-        best_q = result["best_query"]   # (H, W) int — argmax of softmax
-        best_score = result["best_score"]  # (H, W) — softmax max
+        best_q = result["best_query"]    # (H, W) int
+        best_score = result["best_score"]  # (H, W)
         valid = best_score >= args.threshold
         if valid.any():
             for qi in range(Q):
@@ -221,9 +216,6 @@ def main() -> int:
             print(f"  KF {i:3d}/{N}", flush=True)
 
     print(f"[run] grounding loop done in {time.time() - t_run:.1f}s", flush=True)
-
-    for _, w in per_q_writers:
-        w.release()
     combined_writer.release()
 
     print(f"\n=== Per-query coverage stats (mask-pixel fraction, sim range) ===", flush=True)
@@ -233,10 +225,7 @@ def main() -> int:
         print(f"  {q:20s} : {frac*100:5.2f}% pixels above thr={args.threshold:.2f}, "
               f"sim range [{score_min[qi]:+.3f}, {score_max[qi]:+.3f}]", flush=True)
 
-    print(f"\n[done] outputs:", flush=True)
-    for path, _ in per_q_writers:
-        print(f"  {path}", flush=True)
-    print(f"  {combined_path}", flush=True)
+    print(f"\n[done] output:\n  {combined_path}", flush=True)
     return 0
 
 

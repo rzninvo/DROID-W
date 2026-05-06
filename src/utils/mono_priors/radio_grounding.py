@@ -27,12 +27,22 @@ import torch.nn.functional as F
 from src.utils.mono_priors.radseg import RADSegEncoder
 
 
-_DEFAULT_RADIO_VERSION = "c-radio_v3-b"
-_DEFAULT_LANG_ADAPTOR = "siglip2"
+_DEFAULT_RADIO_VERSION = "c-radio_v4-h"
+# RADIO v3-b exposes adaptors ['siglip2', 'sam']; v4 family renames them to
+# ['siglip2-g', 'sam3']. Auto-detected from the version string below; pass
+# explicit `lang_adaptor=` / `sam3=` to override.
+_DEFAULT_LANG_ADAPTOR_V3 = "siglip2"
+_DEFAULT_LANG_ADAPTOR_V4 = "siglip2-g"
 # Default location for the SAM-1 ViT-H checkpoint (`sam_vit_h_4b8939.pth`).
 # Resolved relative to the DROID-W repo root unless the caller passes an
 # absolute path. CVG: /home/cvg/HERMES-SLAM/DROID-W/weights/sam_vit_h_4b8939.pth
 _DEFAULT_SAM_CKPT = "weights/sam_vit_h_4b8939.pth"
+
+
+def _is_v4(version: str) -> bool:
+    """Heuristic: any 'c-radio_v4-*' / 'radio_v4-*' picks v4 conventions."""
+    v = str(version).lower()
+    return "v4" in v
 
 
 def _resolve_sam_ckpt(sam_ckpt: str) -> str:
@@ -52,7 +62,8 @@ class RadioGrounder:
         self,
         device: str = "cuda:0",
         radio_version: str = _DEFAULT_RADIO_VERSION,
-        lang_adaptor: str = _DEFAULT_LANG_ADAPTOR,
+        lang_adaptor: Optional[str] = None,
+        sam3: Optional[bool] = None,
         sam_refinement: bool = True,
         sam_ckpt: str = _DEFAULT_SAM_CKPT,
         text_query_mode: str = "labels",
@@ -66,6 +77,15 @@ class RadioGrounder:
         self.prompt_denoising_thresh = prompt_denoising_thresh
         self._sam_refinement = sam_refinement
         self._sam_ckpt = _resolve_sam_ckpt(sam_ckpt) if sam_refinement else None
+
+        # Adaptor naming differs between v3 (siglip2/sam) and v4 (siglip2-g/sam3).
+        # Auto-detect from the version string unless the caller overrode either.
+        is_v4 = _is_v4(radio_version)
+        if lang_adaptor is None:
+            lang_adaptor = _DEFAULT_LANG_ADAPTOR_V4 if is_v4 else _DEFAULT_LANG_ADAPTOR_V3
+        if sam3 is None:
+            sam3 = is_v4
+
         self._encoder: Optional[RADSegEncoder] = None
         self._encoder_kwargs = dict(
             device=device,
@@ -74,6 +94,7 @@ class RadioGrounder:
             return_radio_features=True,
             compile=False,
             amp=amp,
+            sam3=bool(sam3),
             sam_refinement=sam_refinement,
             sam_ckpt=self._sam_ckpt or "",
         )
@@ -96,7 +117,7 @@ class RadioGrounder:
 
     @property
     def lang_adaptor_name(self) -> str:
-        return self._encoder_kwargs.get("lang_model", _DEFAULT_LANG_ADAPTOR)
+        return self._encoder_kwargs.get("lang_model", _DEFAULT_LANG_ADAPTOR_V3)
 
     @torch.no_grad()
     def set_queries(self, queries: List[str]) -> None:
