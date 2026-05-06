@@ -387,7 +387,20 @@ class VLMSceneScout:
         # which has tighter embeddings — our ViT-B-32 needs a stricter threshold.
         self.dedupe_clip_threshold = vlm_cfg.get("dedupe_clip_threshold", 0.90)
         self.dedupe_clip_model = vlm_cfg.get("dedupe_clip_model", "ViT-B-32")
-        self._clip_dedup = None  # lazy-loaded (model, tokenizer) tuple
+        # SigLIP 2 backend for the same dedup task. Sigmoid-loss image-text
+        # encoder; cosine distribution differs from CLIP, so threshold must
+        # be re-calibrated (start ~0.80; higher in dev).
+        self.dedupe_text_encoder = str(vlm_cfg.get("dedupe_text_encoder", "clip")).lower()
+        if self.dedupe_text_encoder not in ("clip", "siglip2"):
+            raise ValueError(
+                f"dedupe_text_encoder must be 'clip' or 'siglip2', "
+                f"got {self.dedupe_text_encoder!r}"
+            )
+        self.dedupe_siglip2_model = vlm_cfg.get(
+            "dedupe_siglip2_model", "google/siglip2-large-patch16-256"
+        )
+        self._clip_dedup = None        # lazy-loaded (CLIP model, tokenizer)
+        self._siglip2_dedup = None     # lazy-loaded (SigLIP 2 model, processor)
 
         # Adaptive-gating state — count queries since last vocabulary growth.
         self._queries_since_growth = 0
@@ -492,6 +505,52 @@ class VLMSceneScout:
         tokenizer = open_clip.get_tokenizer(self.dedupe_clip_model)
         self._clip_dedup = (model, tokenizer)
 
+    def _ensure_siglip2_dedup_loaded(self):
+        """Lazy-load SigLIP 2 for class-list deduplication. Requires
+        transformers >= 4.49 (Feb 2025)."""
+        if self._siglip2_dedup is not None:
+            return
+        try:
+            from transformers import AutoModel, AutoProcessor
+        except ImportError:
+            logger.warning(
+                "[WARN] vlm_scout dedup: expected transformers>=4.49, got missing — "
+                "fallback=skip dedup (SigLIP 2 disabled)"
+            )
+            self._siglip2_dedup = (None, None)
+            return
+        model = AutoModel.from_pretrained(self.dedupe_siglip2_model)
+        model.eval().to(self.device)
+        processor = AutoProcessor.from_pretrained(self.dedupe_siglip2_model)
+        self._siglip2_dedup = (model, processor)
+
+    @torch.no_grad()
+    def _encode_classes_for_dedup(self, classes: List[str]) -> Optional[torch.Tensor]:
+        """Encode a list of class names to L2-normed text embeddings using
+        whichever backend is configured. Returns None if the backend failed
+        to load (caller should skip dedup)."""
+        if self.dedupe_text_encoder == "siglip2":
+            self._ensure_siglip2_dedup_loaded()
+            model, processor = self._siglip2_dedup
+            if model is None:
+                return None
+            inputs = processor(
+                text=list(classes),
+                padding="max_length",
+                max_length=64,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device)
+            emb = model.get_text_features(**inputs)
+        else:
+            self._ensure_clip_dedup_loaded()
+            model, tokenizer = self._clip_dedup
+            if model is None:
+                return None
+            tokens = tokenizer(list(classes)).to(self.device)
+            emb = model.encode_text(tokens)
+        return emb / emb.norm(dim=-1, keepdim=True)
+
     def dedupe_classes(
         self, classes: List[str], threshold: Optional[float] = None
     ) -> List[str]:
@@ -514,16 +573,10 @@ class VLMSceneScout:
             return list(classes)
         thr = float(threshold if threshold is not None else self.dedupe_clip_threshold)
 
-        self._ensure_clip_dedup_loaded()
-        model, tokenizer = self._clip_dedup
-        if model is None:
+        emb = self._encode_classes_for_dedup(classes)
+        if emb is None:
             return list(classes)
-
-        with torch.no_grad():
-            tokens = tokenizer(classes).to(self.device)
-            emb = model.encode_text(tokens)
-            emb = emb / emb.norm(dim=-1, keepdim=True)
-            sim = (emb @ emb.T).cpu().numpy()
+        sim = (emb @ emb.T).cpu().numpy()
 
         # Union-find clustering on CLIP cosine
         parent = list(range(len(classes)))

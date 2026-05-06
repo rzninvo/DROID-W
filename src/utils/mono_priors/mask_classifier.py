@@ -23,7 +23,19 @@ import torch
 
 
 class MaskClassifier:
-    """FastSAM segment-everything + CLIP-per-mask open-vocab classification."""
+    """FastSAM segment-everything + per-mask open-vocab classification.
+
+    Two image-text encoder backends are supported:
+
+      - 'clip'    : OpenCLIP (default, ViT-B-32). Same as the original
+                    ConceptGraphs / OVO-SLAM recipe.
+      - 'siglip2' : Google SigLIP 2 (Tschannen et al., arXiv 2502.14786).
+                    Sigmoid-loss image-text encoder; outperforms CLIP on
+                    fine-grained zero-shot classification at similar size.
+
+    The encoder choice is local to per-mask labelling — it does NOT change
+    DROID-W's internal DINOv2 feature pipeline.
+    """
 
     # ConceptGraphs/OpenScene-style prompt ensemble. Multiple templates per
     # class are encoded then averaged (and re-normalized) to produce a more
@@ -35,6 +47,10 @@ class MaskClassifier:
         "an image of a {}",
     )
 
+    # SigLIP 2 text inputs MUST be tokenised with padding='max_length' and
+    # max_length=64 (model card requirement, same as SigLIP 1).
+    SIGLIP2_TEXT_MAX_LENGTH = 64
+
     def __init__(
         self,
         classes: List[str],
@@ -42,15 +58,25 @@ class MaskClassifier:
         clip_model: str = "ViT-B-32",
         device: str = "cuda:0",
         prompt_templates: Optional[tuple] = None,
+        encoder: str = "clip",
+        siglip2_model: str = "google/siglip2-large-patch16-256",
     ):
         self.device = device
         self.fastsam = fastsam_model
+        self.encoder_kind = str(encoder).lower()
+        if self.encoder_kind not in ("clip", "siglip2"):
+            raise ValueError(f"encoder must be 'clip' or 'siglip2', got {encoder!r}")
         self.clip_model_name = clip_model
+        self.siglip2_model_name = siglip2_model
         self.prompt_templates = prompt_templates if prompt_templates is not None else self.PROMPT_TEMPLATES
-        self._clip = None
-        self._preprocess = None
-        self._tokenizer = None
-        self._load_clip()
+        self._encoder = None      # backend model (open_clip model OR HF AutoModel)
+        self._preprocess = None   # callable(PIL) → tensor (image preprocessing)
+        self._tokenizer = None    # CLIP backend only
+        self._processor = None    # SigLIP2 backend only (HF AutoProcessor)
+        if self.encoder_kind == "siglip2":
+            self._load_siglip2()
+        else:
+            self._load_clip()
         self.classes: List[str] = []
         self._text_emb: Optional[torch.Tensor] = None
         self.update_vocabulary(classes)
@@ -61,9 +87,54 @@ class MaskClassifier:
             self.clip_model_name, pretrained="openai"
         )
         model.eval().to(self.device)
-        self._clip = model
+        self._encoder = model
         self._preprocess = preprocess
         self._tokenizer = open_clip.get_tokenizer(self.clip_model_name)
+
+    def _load_siglip2(self):
+        # Requires transformers >= 4.49 (Feb 2025) which ships SigLIP 2.
+        from transformers import AutoModel, AutoProcessor
+        model = AutoModel.from_pretrained(self.siglip2_model_name)
+        model.eval().to(self.device)
+        processor = AutoProcessor.from_pretrained(self.siglip2_model_name)
+        self._encoder = model
+        self._processor = processor
+        # Image preprocessing happens via the processor at call time, but
+        # callers expect `_preprocess(pil_img) -> tensor`. Adapt:
+        def _siglip2_preprocess(pil_img):
+            out = processor(images=[pil_img], return_tensors="pt")
+            # Strip batch dim → (3, H, W) tensor
+            return out["pixel_values"].squeeze(0)
+        self._preprocess = _siglip2_preprocess
+
+    @torch.no_grad()
+    def _encode_text(self, prompts: List[str]) -> torch.Tensor:
+        """Encode a list of prompts → L2-normed (N, D) tensor on self.device."""
+        if self.encoder_kind == "siglip2":
+            inputs = self._processor(
+                text=prompts,
+                padding="max_length",
+                max_length=self.SIGLIP2_TEXT_MAX_LENGTH,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device)
+            emb = self._encoder.get_text_features(**inputs)
+        else:
+            tokens = self._tokenizer(prompts).to(self.device)
+            emb = self._encoder.encode_text(tokens)
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+        return emb
+
+    @torch.no_grad()
+    def _encode_image_batch(self, batch_tensor: torch.Tensor) -> torch.Tensor:
+        """Encode a (B, 3, H, W) preprocessed batch → L2-normed (B, D)."""
+        batch = batch_tensor.to(self.device)
+        if self.encoder_kind == "siglip2":
+            emb = self._encoder.get_image_features(pixel_values=batch)
+        else:
+            emb = self._encoder.encode_image(batch)
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+        return emb
 
     @torch.no_grad()
     def update_vocabulary(self, classes: List[str]):
@@ -78,9 +149,7 @@ class MaskClassifier:
             self.classes, self._text_emb = [], None
             return
         all_prompts = [tmpl.format(c) for c in classes for tmpl in self.prompt_templates]
-        tokens = self._tokenizer(all_prompts).to(self.device)
-        emb = self._clip.encode_text(tokens)
-        emb = emb / emb.norm(dim=-1, keepdim=True)
+        emb = self._encode_text(all_prompts)
         # Reshape (K * T, D) -> (K, T, D), mean across templates, renormalize.
         K, T, D = len(classes), len(self.prompt_templates), emb.shape[-1]
         emb = emb.view(K, T, D).mean(dim=1)
@@ -151,9 +220,8 @@ class MaskClassifier:
         img_emb = torch.empty((len(crops), self._text_emb.shape[1]), device=self.device)
         for start in range(0, len(valid_idx), batch_size):
             batch_idx = valid_idx[start:start + batch_size]
-            batch = torch.stack([crops[i] for i in batch_idx]).to(self.device)
-            e = self._clip.encode_image(batch)
-            e = e / e.norm(dim=-1, keepdim=True)
+            batch = torch.stack([crops[i] for i in batch_idx])
+            e = self._encode_image_batch(batch)
             for k, gi in enumerate(batch_idx):
                 img_emb[gi] = e[k]
 
