@@ -236,20 +236,31 @@ class RADSegEncoder(ImageSemSegEncoder):
 
     # Sam refinement args
     self.sam_refinement = sam_refinement
+    self.sam3_model = None
+    self.sam3_processor = None
     if sam_refinement:
       self.sam_iou_thresh = sam_iou_thresh
       self.coarse_thresh = coarse_thresh
       self.minimal_area = minimal_area
       self.sam_mask_coff = sam_mask_coff
-      self.sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(device=self.device).eval()
-      self.sam_predictor = SamPredictor(self.sam)
-      # PATCH (HERMES-SLAM): only delete SAM's image_encoder when we plan to
-      # inject RADIO features (v3 path with `sam` adaptor producing 1280-ch
-      # features). Under v4 (sam3=True) SAM-1's neck would receive 1024-ch
-      # features which crashes the forward; instead we keep the full SAM-1
-      # ViT-H encoder and feed the raw image through SAM's standard pipeline
-      # — see the if/else split in encode_image_to_feat_map below.
-      if not self.sam3:
+      if self.sam3:
+        # PATCH (HERMES-SLAM): SAM-3 (Meta, 2025) is a text-prompted
+        # detection+segmentation model with a transformers API
+        # (Sam3Model + Sam3Processor) — *not* a SamPredictor-compatible
+        # box/point/mask refiner. We use it directly with each user query
+        # as text and union its instance masks; see sam3_refinement.py.
+        # Loading via transformers.from_pretrained downloads the gated
+        # facebook/sam3 weights (HF auth must be set up beforehand).
+        from transformers import Sam3Model, Sam3Processor
+        self.sam3_model = Sam3Model.from_pretrained("facebook/sam3").to(
+            device=self.device).eval()
+        self.sam3_processor = Sam3Processor.from_pretrained("facebook/sam3")
+      else:
+        self.sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(
+            device=self.device).eval()
+        self.sam_predictor = SamPredictor(self.sam)
+        # SAM-1 v3-injection path: features come from RADIO so the encoder
+        # blocks/patch_embed are unused — delete to save VRAM.
         del self.sam.image_encoder.blocks
         del self.sam.image_encoder.patch_embed
       torch.cuda.empty_cache()
@@ -337,18 +348,42 @@ class RADSegEncoder(ImageSemSegEncoder):
     max_sim_per_pixel, seg_pred = torch.max(seg_probs, dim=1, keepdim=True) # Bx1xHxW
 
     if self.sam_refinement:
-      seg_pred_ref = list()
-      seg_probs_ref = list()
-      for b in range(B):
-        if self.sam3:
-          # PATCH (HERMES-SLAM): v4 'sam3' adaptor outputs 1024-ch features
-          # which are incompatible with SAM-1 ViT-H's 1280-ch neck. Run SAM-1
-          # on the raw image with its STANDARD pipeline (full ViT-H encoder)
-          # instead of injecting RADIO features.
+      if self.sam3:
+        # PATCH (HERMES-SLAM): SAM-3 path. SAM-3 is itself a text-prompted
+        # detector+segmenter, not a SamPredictor-compatible refiner — it
+        # has no notion of "refine these coarse masks". So we OVERWRITE
+        # seg_probs/seg_pred with SAM-3's per-query output. RADIO grounding
+        # is still computed above (used for prompt denoising etc.) but the
+        # final masks are SAM-3's.
+        from .sam3_refinement import sam3_refinement as _sam3_refine
+        seg_pred_ref = list()
+        seg_probs_ref = list()
+        for b in range(B):
           img_np = (rgb_image[b].permute(1, 2, 0).clamp(0, 1) * 255.0
                     ).detach().cpu().numpy().astype('uint8')
-          self.sam_predictor.set_image(img_np)
-        else:
+          probs_b, pred_b = _sam3_refine(
+            img_np, self.prompts, self.sam3_model, self.sam3_processor,
+            device=self.device,
+          )
+          # probs_b: (Q, H, W), pred_b: (1, H, W). Match upstream per-image
+          # element shape (C, H, W) and (1, H, W) before the batch stack.
+          seg_probs_ref.append(probs_b)
+          seg_pred_ref.append(pred_b)
+        seg_pred = torch.stack(seg_pred_ref, dim=0)   # (B, 1, H, W)
+        seg_probs = torch.stack(seg_probs_ref, dim=0) # (B, Q, H, W)
+        # Recompute max_sim_per_pixel from SAM-3's seg_probs so the
+        # downstream ignore_label step thresholds against the correct
+        # values (the variable from before refinement is now stale).
+        max_sim_per_pixel = seg_probs.amax(dim=1, keepdim=True)
+        # Bump prediction_thresh slightly — without this the default 0.0
+        # lets pixels where SAM-3 returned all-zero scores keep their
+        # arbitrary argmax instead of becoming the ignore class.
+        if self.prediction_thresh <= 0.0:
+          self.prediction_thresh = 0.05
+      else:
+        seg_pred_ref = list()
+        seg_probs_ref = list()
+        for b in range(B):
           # Original v3 path: inject RADIO 'sam' adaptor features into SAM-1's
           # neck. Saves a SAM ViT-H forward pass.
           sam_image, new_h, new_w = self._preprocess_sam(rgb_image[b], target_size=1024)
@@ -361,15 +396,15 @@ class RADSegEncoder(ImageSemSegEncoder):
           self.sam_predictor.original_size = orig_img_size
           self.sam_predictor.input_size = (new_h, new_w)
 
-        refined_masks, scores, refined_logits, prompt_boxes = sam_refinement(
-          orig_img_size, seg_pred[b], seg_probs[b], num_cls, self.sam_predictor,
-          self.coarse_thresh, self.minimal_area,
-          self.sam_mask_coff, self.sam_iou_thresh)
+          refined_masks, scores, refined_logits, prompt_boxes = sam_refinement(
+            orig_img_size, seg_pred[b], seg_probs[b], num_cls, self.sam_predictor,
+            self.coarse_thresh, self.minimal_area,
+            self.sam_mask_coff, self.sam_iou_thresh)
 
-        seg_pred_ref.append(refined_masks)
-        seg_probs_ref.append(refined_logits)
-      seg_pred = torch.stack(seg_pred_ref, dim=0)
-      seg_probs = torch.stack(seg_probs_ref, dim=0)
+          seg_pred_ref.append(refined_masks)
+          seg_probs_ref.append(refined_logits)
+        seg_pred = torch.stack(seg_pred_ref, dim=0)
+        seg_probs = torch.stack(seg_probs_ref, dim=0)
 
     # Set low confidence predictions to the ignore label
     if ignore_label:
