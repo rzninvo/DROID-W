@@ -114,23 +114,33 @@ class RadioGrounder:
         self._text_emb = emb  # (Q, D_lang)
 
     @torch.no_grad()
-    def segment(self, image_np: np.ndarray) -> dict:
-        """Per-pixel similarity for one RGB keyframe.
+    def segment(
+        self,
+        image_np: np.ndarray,
+        softmax_temperature: float = 100.0,
+    ) -> dict:
+        """Per-pixel similarity + softmax-over-queries for one RGB keyframe.
 
         Parameters
         ----------
         image_np : np.ndarray
             (H, W, 3) RGB uint8 OR float32 in [0, 1].
+        softmax_temperature : float
+            Scale applied before per-pixel softmax over queries. Matches
+            RADIO-ViPE's compute_cos_sim(softmax=True) which uses 100. Higher
+            temperature → sharper distribution; the winner dominates.
 
         Returns
         -------
         dict with keys
-            'similarity' : np.float32 (Q, H, W) — per-query cosine similarity
-                           upsampled bilinearly to the original image
-                           resolution.
-            'best_query' : np.int32 (H, W) — argmax over queries; -inf-thresh
-                           handling is left to the caller.
-            'best_score' : np.float32 (H, W).
+            'similarity' : np.float32 (Q, H, W) — raw cosine similarity per
+                           query, upsampled bilinearly to original resolution.
+            'softmax'    : np.float32 (Q, H, W) — softmax over queries,
+                           same upsample. Use this for thresholding when you
+                           want "this query wins by a margin".
+            'best_query' : np.int32 (H, W) — argmax over queries.
+            'best_score' : np.float32 (H, W) — softmax probability of the
+                           winning query (range [0, 1]).
             'queries'    : list of str — for convenience.
         """
         if self._text_emb is None or len(self._queries) == 0:
@@ -189,18 +199,35 @@ class RadioGrounder:
         sim = (img @ self._text_emb.t()).reshape(1, H_t, W_t, len(self._queries))
         sim = sim.permute(0, 3, 1, 2)  # (1, Q, H_t, W_t)
 
-        # Upsample to original image resolution.
+        # Per-pixel softmax over queries at low resolution (cheaper than
+        # softmax at full image res). Temperature scaling matches RADIO-ViPE's
+        # compute_cos_sim(softmax=True) which uses 100. Without this, pixels
+        # whose winning class barely edges out the runner-up will paint
+        # whichever class they prefer; with this, only confidently-classified
+        # pixels survive the post-softmax threshold.
+        prob = F.softmax(sim * float(softmax_temperature), dim=1)
+
+        # Upsample BOTH similarity and softmax probability to original image
+        # resolution. Bilinear on similarity is fine; bilinear on softmax
+        # breaks the per-pixel sum-to-1 invariant slightly but is what the
+        # upstream radseg_encoder._get_seg_logits also does (line 316–317).
         sim_full = F.interpolate(
             sim, size=(H_orig, W_orig),
             mode="bilinear", align_corners=False,
-        )[0]  # (Q, H, W)
+        )[0]
+        prob_full = F.interpolate(
+            prob, size=(H_orig, W_orig),
+            mode="bilinear", align_corners=False,
+        )[0]
 
         sim_np = sim_full.cpu().numpy().astype(np.float32)
-        best_score = sim_np.max(axis=0)
-        best_query = sim_np.argmax(axis=0).astype(np.int32)
+        prob_np = prob_full.cpu().numpy().astype(np.float32)
+        best_score = prob_np.max(axis=0)
+        best_query = prob_np.argmax(axis=0).astype(np.int32)
 
         return {
             "similarity": sim_np,
+            "softmax": prob_np,
             "best_query": best_query,
             "best_score": best_score,
             "queries": list(self._queries),

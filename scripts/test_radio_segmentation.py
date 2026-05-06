@@ -106,9 +106,16 @@ def main() -> int:
                    help="Scene directory containing video.npz, e.g. Outputs/TUM_RGBD/freiburg3_walking_static")
     p.add_argument("--queries", required=True, nargs="+",
                    help="One or more text queries, e.g. person monitor 'office chair'")
-    p.add_argument("--threshold", type=float, default=0.20,
-                   help="Cosine threshold for binary mask (default 0.20). RADIO+SigLIP "
-                        "cosines on real images cluster ~0.10–0.30; tune empirically.")
+    p.add_argument("--threshold", type=float, default=0.50,
+                   help="Per-pixel softmax-over-queries threshold for binary mask "
+                        "(default 0.50). With temperature=100 (RADIO-ViPE default), "
+                        "a confident pixel scores ~0.9+ for its winning query. "
+                        "Threshold semantics: 'winning query beats runners-up' — "
+                        "0.50 = 2× runner-up, 0.85 ~= 5× runner-up. "
+                        "Pass --raw-cosine to threshold raw cosine instead.")
+    p.add_argument("--raw-cosine", action="store_true",
+                   help="Threshold on raw cosine similarity instead of softmax. "
+                        "Useful for diagnostics; cosine values cluster 0.05-0.20.")
     p.add_argument("--output", type=Path, default=None,
                    help="Output dir (default: <scene>/radio_seg).")
     p.add_argument("--fps", type=int, default=5)
@@ -174,29 +181,33 @@ def main() -> int:
     score_min = np.full(Q, np.inf, dtype=np.float64)
     score_max = np.full(Q, -np.inf, dtype=np.float64)
 
-    print(f"[run] grounding {N} keyframes ...", flush=True)
+    score_field = "similarity" if args.raw_cosine else "softmax"
+    print(f"[run] grounding {N} keyframes ; thresholding on '{score_field}' "
+          f"@ {args.threshold}", flush=True)
     t_run = time.time()
     for i in range(N):
         rgb = images[i].transpose(1, 2, 0)  # (H, W, 3) uint8 RGB
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         result = grounder.segment(rgb)
-        sim = result["similarity"]   # (Q, H, W)
+        score = result[score_field]   # (Q, H, W)
 
         # Per-query writer with that query's binary mask + colour
         for qi in range(Q):
-            mask_q = sim[qi] >= args.threshold
+            mask_q = score[qi] >= args.threshold
             per_q_pixels[qi] += int(mask_q.sum())
-            score_min[qi] = min(score_min[qi], float(sim[qi].min()))
-            score_max[qi] = max(score_max[qi], float(sim[qi].max()))
+            score_min[qi] = min(score_min[qi], float(score[qi].min()))
+            score_max[qi] = max(score_max[qi], float(score[qi].max()))
             frame = _overlay_mask(bgr, mask_q, colours[qi])
             frame = _draw_legend(frame, [args.queries[qi]], [colours[qi]], i, N)
             per_q_writers[qi][1].write(frame)
 
-        # Combined: each pixel takes the highest-scoring query above threshold.
-        # Pixels below threshold for ALL queries stay un-coloured.
+        # Combined: each pixel takes the winning query (argmax over queries
+        # in softmax space), but only if best_score (softmax probability of
+        # the winning query) is above threshold. Pixels below threshold for
+        # all queries stay un-coloured.
         combined = bgr.copy()
-        best_q = result["best_query"]   # (H, W) int
-        best_score = result["best_score"]
+        best_q = result["best_query"]   # (H, W) int — argmax of softmax
+        best_score = result["best_score"]  # (H, W) — softmax max
         valid = best_score >= args.threshold
         if valid.any():
             for qi in range(Q):
