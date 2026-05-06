@@ -86,6 +86,29 @@ class RadioGrounder:
         if sam3 is None:
             sam3 = is_v4
 
+        # SAM refinement compatibility check.
+        # Upstream radseg_encoder.py wires the RADIO sam-adaptor output straight
+        # into SAM's image_encoder.neck. The neck dim is set by the SAM weights:
+        #   SAM-1 ViT-H (sam_vit_h_4b8939.pth):  expects 1280-channel input.
+        # The RADIO adaptor output dims are:
+        #   v3-b 'sam' adaptor:   1280 ✓ (matches SAM-1 neck)
+        #   v4 'sam3' adaptor:    1024 ✗ (would need SAM-3 weights; SAM-3 has
+        #                                  not been integrated upstream yet).
+        # We can't silently load SAM-1 with v4 — it crashes the forward pass.
+        if sam_refinement and bool(sam3):
+            print(
+                "[WARN] radio_grounding: sam_refinement requested with the v4 "
+                "'sam3' adaptor; expected=SAM-3 weights with 1024-channel neck, "
+                "got=SAM-1 ViT-H ('sam_vit_h_4b8939.pth') with 1280-channel neck, "
+                "fallback=disable SAM refinement (RADIO grounding still runs). "
+                "Pass --radio-version=c-radio_v3-b to keep SAM-1 refinement, "
+                "or supply SAM-3 weights once they're publicly released.",
+                flush=True,
+            )
+            sam_refinement = False
+            self._sam_refinement = False
+            self._sam_ckpt = None
+
         self._encoder: Optional[RADSegEncoder] = None
         self._encoder_kwargs = dict(
             device=device,
