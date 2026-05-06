@@ -83,6 +83,21 @@ class RadioGrounder:
     # Public API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Read-only delegations (kept for compatibility with the test script's
+    # informational logging).
+    # ------------------------------------------------------------------
+
+    @property
+    def patch_size(self) -> int:
+        if self._encoder is None:
+            return 16  # RADIO defaults; only used for logging before set_queries
+        return int(getattr(self._encoder.model, "patch_size", 16))
+
+    @property
+    def lang_adaptor_name(self) -> str:
+        return self._encoder_kwargs.get("lang_model", _DEFAULT_LANG_ADAPTOR)
+
     @torch.no_grad()
     def set_queries(self, queries: List[str]) -> None:
         """Build (or rebuild) the encoder in predict-mode for these queries."""
