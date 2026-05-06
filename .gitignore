@@ -31,3 +31,10 @@ yolov8s-worldv2.pt
 thirdparty/diff-gaussian-rasterization-w-pose
 thirdparty/lietorch
 thirdparty/simple-knn
+
+# Credentials — never commit
+.env
+.env.*
+*.token
+weights/
+
