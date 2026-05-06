@@ -42,12 +42,20 @@ def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
 
 
 def _pose_to_world_from_cam(pose_7: Sequence[float]) -> np.ndarray:
-    """tum_poses row → 4x4 camera-to-world matrix (same convention DROID-W uses)."""
+    """tum_poses row → 4x4 world-from-camera (T_w_c) matrix.
+
+    DROID-W stores poses as cam_T_world (the rigid transform that maps a
+    world-frame point INTO the camera frame: p_cam = R*p_world + t).
+    To unproject camera-frame points back to world coordinates we need the
+    inverse — see seg_model.compute_reprojection_consistency for the same
+    convention (and section 4.8 of hermes_report.pdf for the failure case
+    that tested this).
+    """
     tx, ty, tz, qx, qy, qz, qw = pose_7
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = _quat_to_R(qx, qy, qz, qw)
-    T[:3,  3] = (tx, ty, tz)
-    return T
+    T_cw = np.eye(4, dtype=np.float64)
+    T_cw[:3, :3] = _quat_to_R(qx, qy, qz, qw)
+    T_cw[:3,  3] = (tx, ty, tz)
+    return np.linalg.inv(T_cw)
 
 
 # -----------------------------------------------------------------------------
