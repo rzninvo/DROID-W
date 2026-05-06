@@ -29,6 +29,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -83,6 +84,78 @@ _OPENAI_IMAGENET_TEMPLATES = [
 _DEFAULT_SLIDE_CROP = 336
 _DEFAULT_SLIDE_STRIDE = 224
 
+# SCRA / SCGA temperature scaling — match radseg_encoder defaults (10.0 each).
+_DEFAULT_SCRA_SCALING = 10.0
+_DEFAULT_SCGA_SCALING = 10.0
+
+
+class _SelfCorrelatingRecursiveAttn(nn.Module):
+    """Vendored from radseg_encoder.SelfCorrelatingRecursiveAttn (lines 74-139).
+
+    Wraps the original ViT attention block. Standard attention runs first;
+    its output tokens are then L2-normalized and re-attended to themselves
+    (with a softmax temperature `scra_scaling`). This second pass spreads
+    high-confidence per-token decisions to feature-similar neighbour
+    tokens — RADIO-ViPE's named answer to the per-pixel "holes" problem.
+    """
+
+    def __init__(self, orig_attn, device, dim: int,
+                 qk_norm: bool = False, scra_scaling: float = _DEFAULT_SCRA_SCALING):
+        super().__init__()
+        num_heads = orig_attn.num_heads
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = orig_attn.qkv
+        self.q_norm = orig_attn.q_norm if qk_norm else nn.Identity()
+        self.k_norm = orig_attn.k_norm if qk_norm else nn.Identity()
+        self.attn_drop = orig_attn.attn_drop
+        self.proj = orig_attn.proj
+        self.proj_drop = orig_attn.proj_drop
+        self.device = device
+        self.scra_scaling = scra_scaling
+
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # Upstream interface uses (N, B, C) tokens-first ordering.
+        x_t = x.permute(1, 0, 2)
+        x_t = self._custom_attn(x_t)
+        return x_t.permute(1, 0, 2)
+
+    def _custom_attn(self, x):
+        num_heads = self.num_heads
+        num_tokens, bsz, embed_dim = x.size()
+        head_dim = embed_dim // num_heads
+        scale = head_dim ** -0.5
+
+        # Standard QKV attention.
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k = self.q_norm(q), self.k_norm(k)
+        q = q.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+
+        attn_weights = torch.bmm(q, k.transpose(1, 2)) * scale
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_output = torch.bmm(attn_weights, v)
+        attn_output = attn_output.transpose(0, 1).contiguous().view(
+            -1, bsz, embed_dim)
+        attn_output = self.proj(attn_output)
+        attn_output = self.proj_drop(attn_output)
+
+        # Self-Correlating Recursive Attention.
+        attn_output = attn_output.view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        sim_tokens = F.normalize(attn_output, dim=-1)
+        sim_matrix = torch.bmm(sim_tokens, sim_tokens.transpose(1, 2)) * self.scra_scaling
+        sim_matrix[sim_matrix < 0] = -torch.inf
+        sim_matrix = F.softmax(sim_matrix, dim=-1)
+        attn_output = torch.bmm(sim_matrix, v)
+        attn_output = attn_output.transpose(0, 1).contiguous().view(
+            -1, bsz, embed_dim)
+        attn_output = self.proj(attn_output)
+        attn_output = self.proj_drop(attn_output)
+        return attn_output
+
 
 class RadioGrounder:
     """Loads RADIO + SigLIP-2 once, exposes per-keyframe text grounding."""
@@ -97,6 +170,10 @@ class RadioGrounder:
         slide_crop: int = _DEFAULT_SLIDE_CROP,
         slide_stride: int = _DEFAULT_SLIDE_STRIDE,
         prompt_ensemble: bool = True,
+        scra: bool = True,
+        scga: bool = True,
+        scra_scaling: float = _DEFAULT_SCRA_SCALING,
+        scga_scaling: float = _DEFAULT_SCGA_SCALING,
     ):
         self.device = device
         self.radio_version = radio_version
@@ -106,6 +183,9 @@ class RadioGrounder:
         self.slide_crop = slide_crop
         self.slide_stride = slide_stride
         self.prompt_ensemble = prompt_ensemble
+        self.scra = scra
+        self.scga = scga
+        self.scga_scaling = float(scga_scaling)
 
         # Load RADIO via torch.hub. Caches under ~/.cache/torch/hub.
         # Using source='github' (default) so the repo auto-clones.
@@ -128,6 +208,26 @@ class RadioGrounder:
         model.adaptors = None
         self.model = model
         self.patch_size = int(getattr(model, "patch_size", 16))
+
+        # Install Self-Correlating Recursive Attention on the last block.
+        # Direct port from radseg_encoder.__init__ (lines 197-202). Mutates
+        # the loaded model in place; only do it once.
+        if self.scra:
+            try:
+                last_block = self.model.model.blocks[-1]
+                last_block.attn = _SelfCorrelatingRecursiveAttn(
+                    last_block.attn,
+                    dim=self.model.model.embed_dim,
+                    device=self.device,
+                    scra_scaling=scra_scaling,
+                ).to(self.device)
+            except (AttributeError, IndexError) as e:
+                print(
+                    f"[WARN] radio_grounding: expected RADIO model.model.blocks[-1].attn, "
+                    f"got {type(e).__name__}: {e}; fallback=disable SCRA",
+                    flush=True,
+                )
+                self.scra = False
 
         # Cached text embeddings — populated by set_queries().
         self._queries: List[str] = []
@@ -231,9 +331,18 @@ class RadioGrounder:
         H_orig, W_orig = x.shape[-2], x.shape[-1]
 
         if self.sliding_window:
-            feat_map, H_t, W_t = self._sliding_inference(x)
+            feat_map, H_t, W_t, n_windows = self._sliding_inference(x)
         else:
             feat_map, H_t, W_t = self._single_inference(x)
+            n_windows = 1
+
+        # Self-Correlating Global Aggregation: only meaningful when sliding
+        # actually used >1 window (otherwise it's a no-op self-attention).
+        # Direct port from radseg_encoder._self_correlating_global_aggregation
+        # (lines 438-450). Specifically designed to reduce inter-class bleed
+        # by sharpening global discriminability.
+        if self.scga and n_windows > 1:
+            feat_map = self._self_correlating_global_aggregation(feat_map)
 
         # head_mlp expects (B, N, D_in); our feat_map is (B, D_in, H_t, W_t).
         B, D_in, _, _ = feat_map.shape
@@ -317,12 +426,15 @@ class RadioGrounder:
     def _sliding_inference(self, x: torch.Tensor):
         """Sliding-window forward — averages backbone features over overlapping
         crops. Direct port of radseg_encoder._sliding_inference (lines
-        538-573); we keep just the parts we need (no SCGA, no SAM).
+        538-573).
 
         Returns
         -------
-        feat_map : (1, 768, H_t, W_t) — backbone features at H_img/16, W_img/16.
-        H_t, W_t : token grid dimensions of the crop-padded input.
+        feat_map  : (1, 768, H_t, W_t) — backbone features at H_pad/16.
+        H_t, W_t  : token grid dimensions of the crop-padded input.
+        n_windows : number of crops the input was split into (1 if no
+                    overlap, more otherwise). Caller may use this to decide
+                    whether to run SCGA.
         """
         crop = self.slide_crop
         stride = self.slide_stride
@@ -385,4 +497,25 @@ class RadioGrounder:
             feat_map[:, :, y1:y2, x1:x2] += per_crop[k:k+1]
             count_map[:, :, y1:y2, x1:x2] += 1
         feat_map = feat_map / count_map.clamp_min(1)
-        return feat_map, H_t, W_t
+        n_windows = h_grids * w_grids
+        return feat_map, H_t, W_t, n_windows
+
+    @torch.no_grad()
+    def _self_correlating_global_aggregation(self, feat_map: torch.Tensor) -> torch.Tensor:
+        """Vendored from radseg_encoder._self_correlating_global_aggregation
+        (lines 438-450). Spreads features across the full token grid via
+        token-token similarity attention; reduces inter-class bleed.
+
+        Parameters
+        ----------
+        feat_map : (B, D, H_t, W_t) backbone features.
+        """
+        b, tokens, h, w = feat_map.shape
+        flat = feat_map.flatten(2, 3).transpose(1, 2)               # (B, N, D)
+        sim_tokens = F.normalize(flat, dim=-1)
+        sim_matrix = torch.bmm(sim_tokens, sim_tokens.transpose(1, 2))
+        sim_matrix = (sim_matrix - torch.mean(sim_matrix)) * self.scga_scaling
+        sim_matrix[sim_matrix < 0] = -torch.inf
+        sim_matrix = F.softmax(sim_matrix, dim=-1)
+        agg = torch.bmm(sim_matrix, flat)                           # (B, N, D)
+        return agg.transpose(1, 2).view(b, tokens, h, w)

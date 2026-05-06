@@ -108,10 +108,10 @@ def main() -> int:
                    help="One or more text queries, e.g. person monitor 'office chair'")
     p.add_argument("--threshold", type=float, default=0.50,
                    help="Per-pixel softmax-over-queries threshold for binary mask "
-                        "(default 0.50). With temperature=100 (RADIO-ViPE default), "
-                        "a confident pixel scores ~0.9+ for its winning query. "
-                        "Threshold semantics: 'winning query beats runners-up' — "
-                        "0.50 = 2× runner-up, 0.85 ~= 5× runner-up. "
+                        "(default 0.50, calibrated on freiburg3_walking_static). "
+                        "With temperature=100 (RADIO-ViPE default), 0.50 means the "
+                        "winning query is at least ~2× as likely as the runner-up. "
+                        "Raise to 0.85 for stricter, drop toward 0.20 for fuller fill. "
                         "Pass --raw-cosine to threshold raw cosine instead.")
     p.add_argument("--raw-cosine", action="store_true",
                    help="Threshold on raw cosine similarity instead of softmax. "
