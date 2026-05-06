@@ -340,6 +340,13 @@ def stream_scene_graph(
             except Exception:
                 pass
 
+    # Flush so callers that stat() the .rrd right after this returns see the
+    # real size (rerun otherwise relies on its atexit hook).
+    try:
+        rr.flush_blocking()
+    except Exception:
+        pass
+
     print(
         f"[scene_graph_rerun] Logged {N} keyframes "
         f"(grid {grid_h}x{grid_w} per frame, subsample={s})"
