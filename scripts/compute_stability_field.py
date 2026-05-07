@@ -139,38 +139,48 @@ def _correspondence_grid(depth_i, T_w_i, T_j_w, K, device):
 
 @torch.no_grad()
 def stability_for_scene(images, poses, depths, K, dino_feats,
-                        window: int, device: str):
+                        window: int, device: str,
+                        upstream_zero_invalid: bool = True):
     """Compute per-keyframe stability field S of shape (N, H, W).
 
-    Per upstream:
+    Per upstream RADIO-ViPE (vipe/slam/ba/terms.py:457-532):
         cs[i,j,u] = cosine_sim( feat_i[u], grid_sample(feat_j, coord_ij[u]) )
+        — and upstream multiplies by valid_map (line 500), so invalid
+          pixels contribute 0 to the cosine sum. The mean/var are then
+          taken over ALL n_neighbors (not just valid ones). This biases
+          low-overlap pixels toward low S — see the corner-red artifact.
+
         S_i(u)    = mean_j(cs[i,j,u]) * (1 - var_j(cs[i,j,u]))
+
+    `upstream_zero_invalid=True`  → match upstream exactly: divide by
+                                    n_neighbors, zeros for invalid.
+    `upstream_zero_invalid=False` → divide by n_valid only (less biased
+                                    at boundaries; differs from upstream).
     """
     N, _, H, W = images.shape
     feat_h, feat_w = dino_feats.shape[1], dino_feats.shape[2]
     print(f"[stability] N={N}, image={H}x{W}, feat={feat_h}x{feat_w} "
-          f"(D={dino_feats.shape[3]}), window=±{window}", flush=True)
+          f"(D={dino_feats.shape[3]}), window=±{window}, "
+          f"upstream_zero_invalid={upstream_zero_invalid}", flush=True)
 
     feats_t = torch.from_numpy(dino_feats).float().to(device)        # (N, h, w, D)
     feats_t = feats_t.permute(0, 3, 1, 2).contiguous()               # (N, D, h, w)
     feats_t = F.normalize(feats_t, dim=1, eps=1e-8)
 
-    S = torch.zeros(N, H, W, device=device, dtype=torch.float32)
-    valid_count = torch.zeros(N, H, W, device=device, dtype=torch.float32)
-
     sum_cs = torch.zeros(N, H, W, device=device, dtype=torch.float32)
     sum_cs2 = torch.zeros(N, H, W, device=device, dtype=torch.float32)
-    n_cs = torch.zeros(N, H, W, device=device, dtype=torch.float32)
+    n_valid = torch.zeros(N, H, W, device=device, dtype=torch.float32)
+    n_total = torch.zeros(N, device=device, dtype=torch.float32)  # window-bounded count
 
     t0 = time.time()
     for i in range(N):
         T_w_i = _T_world_from_cam(poses[i])
         depth_i = torch.from_numpy(depths[i]).double().to(device)
-        # Upsample frame-i features to image resolution once.
         feat_i_full = F.interpolate(
             feats_t[i:i+1], size=(H, W), mode="bilinear", align_corners=True,
         )                                                            # (1, D, H, W)
 
+        n_neigh_i = 0
         for j in range(max(0, i - window), min(N, i + window + 1)):
             if j == i:
                 continue
@@ -178,7 +188,6 @@ def stability_for_scene(images, poses, depths, K, dino_feats,
             grid, valid = _correspondence_grid(
                 depth_i, T_w_i, T_j_w, K, device,
             )
-            # Sample frame-j features at the reprojection grid (image res).
             feat_j_full = F.interpolate(
                 feats_t[j:j+1], size=(H, W), mode="bilinear", align_corners=True,
             )                                                        # (1, D, H, W)
@@ -190,28 +199,33 @@ def stability_for_scene(images, poses, depths, K, dino_feats,
 
             cs = (feat_i_full * sampled).sum(dim=1, keepdim=False)   # (1, H, W)
             v = valid.float()
-            cs_v = cs * v
+            cs_v = cs * v   # zero out invalid (upstream line 500)
 
             sum_cs[i] += cs_v[0]
-            sum_cs2[i] += (cs * cs * v)[0]
-            n_cs[i] += v[0]
+            sum_cs2[i] += (cs_v * cs_v)[0]   # squared-with-zero matches upstream var
+            n_valid[i] += v[0]
+            n_neigh_i += 1
+        n_total[i] = float(n_neigh_i)
 
         if i % 10 == 0:
             print(f"  KF {i:3d}/{N}  ({time.time()-t0:5.1f}s)", flush=True)
 
-    n_safe = n_cs.clamp_min(1e-3)
-    mean_cs = sum_cs / n_safe
-    mean_cs2 = sum_cs2 / n_safe
+    if upstream_zero_invalid:
+        # Divide by total window neighbours (n_total broadcast per-frame).
+        denom = n_total.view(N, 1, 1).clamp_min(1.0)
+    else:
+        denom = n_valid.clamp_min(1.0)
+
+    mean_cs = sum_cs / denom
+    mean_cs2 = sum_cs2 / denom
     var_cs = (mean_cs2 - mean_cs * mean_cs).clamp_min(0.0)
     S = (mean_cs * (1.0 - var_cs)).clamp(0.0, 1.0)
-    # Frames with zero overlap: leave S at 0 (treated as fully dynamic
-    # downstream; would need a [WARN] in production but here we just
-    # surface it via an info print).
-    n_zero = int((n_cs.sum(dim=(1, 2)) == 0).sum().item())
+
+    n_zero = int((n_valid.sum(dim=(1, 2)) == 0).sum().item())
     if n_zero > 0:
         print(f"[WARN] stability: {n_zero} keyframes had zero overlap "
               f"with the temporal window — their S is left at 0", flush=True)
-    return S.cpu().numpy(), n_cs.cpu().numpy()
+    return S.cpu().numpy(), n_valid.cpu().numpy()
 
 
 # ----------------------------------------------------------------------
@@ -256,18 +270,30 @@ def _heatmap_overlay(rgb_bgr, scalar_0_1, colormap=cv2.COLORMAP_TURBO,
     return cv2.addWeighted(rgb_bgr, blend, h_color, 1.0 - blend, 0)
 
 
-def _alpha_overlay(rgb_bgr, alpha):
+def _alpha_overlay(rgb_bgr, alpha, mask=None):
     """Three-regime colour code.
-    α near 0 → red (dynamic)
-    α near 1 → yellow (movable)
-    α near 2 → blue (static)
+    α near -2 → red (dynamic)
+    α near 1  → yellow (movable)
+    α near 2  → blue (static)
+    Pixels where mask is False are passed through (no overlay) so they
+    don't get a spurious dynamic colour.
     """
     H, W = alpha.shape
+    # Normalise alpha from [-2, 2] to [0, 1] for colour mapping.
+    a01 = np.clip((alpha + 2.0) / 4.0, 0.0, 1.0)
     out = np.zeros((H, W, 3), dtype=np.uint8)
-    out[..., 2] = (255 * np.clip(2.0 - alpha, 0.0, 2.0) / 2.0).astype(np.uint8)
-    out[..., 1] = (255 * (1.0 - np.abs(alpha - 1.0))).clip(0, 255).astype(np.uint8)
-    out[..., 0] = (255 * np.clip(alpha, 0.0, 2.0) / 2.0).astype(np.uint8)
-    return cv2.addWeighted(rgb_bgr, 0.55, out, 0.45, 0)
+    # B (static / blue) ↑ as a01 ↑
+    out[..., 0] = (255 * a01).astype(np.uint8)
+    # R (dynamic / red) ↑ as a01 ↓
+    out[..., 2] = (255 * (1.0 - a01)).astype(np.uint8)
+    # G (movable / yellow) peaks at a01 ≈ 0.75 (α=1)
+    g = 1.0 - np.abs(a01 - 0.75) * 4.0
+    out[..., 1] = (255 * np.clip(g, 0.0, 1.0)).astype(np.uint8)
+    blended = cv2.addWeighted(rgb_bgr, 0.55, out, 0.45, 0)
+    if mask is not None:
+        m3 = mask.astype(bool)[..., None]
+        blended = np.where(m3, blended, rgb_bgr)
+    return blended
 
 
 # ----------------------------------------------------------------------
@@ -279,6 +305,23 @@ def main() -> int:
     p.add_argument("--scene", type=Path, required=True)
     p.add_argument("--window", type=int, default=5,
                    help="±N temporal-window for cosine sims (default 5)")
+    p.add_argument("--min-overlap", type=int, default=1,
+                   help="Pixels with valid-neighbour count < this are masked "
+                        "(rendered as raw RGB, NOT mapped to dynamic). "
+                        "Set 1 to keep upstream behaviour (corners red); "
+                        "raise to suppress boundary false-positives.")
+    p.add_argument("--upstream-zero", action="store_true", default=True,
+                   help="Match upstream: divide by total window neighbours "
+                        "(zeros for invalid). Default True (faithful port).")
+    p.add_argument("--no-upstream-zero", dest="upstream_zero",
+                   action="store_false",
+                   help="Divide by valid count only (less boundary bias, "
+                        "non-faithful).")
+    p.add_argument("--thresh-movable", type=float, default=0.35)
+    p.add_argument("--thresh-static", type=float, default=0.75)
+    p.add_argument("--tag", type=str, default="",
+                   help="Suffix for output files (e.g. 'w5_mo3' produces "
+                        "stability_w5_mo3.mp4)")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--fps", type=int, default=5)
     p.add_argument("--max-keyframes", type=int, default=None)
@@ -287,7 +330,8 @@ def main() -> int:
     scene = args.scene.resolve()
     out_dir = scene / "stability"
     out_dir.mkdir(exist_ok=True)
-    print(f"[setup] scene={scene}  output={out_dir}", flush=True)
+    suffix = f"_{args.tag}" if args.tag else ""
+    print(f"[setup] scene={scene}  output={out_dir}  tag={args.tag or '(none)'}", flush=True)
 
     npz = np.load(scene / "video.npz")
     images = npz["images"]
@@ -329,25 +373,76 @@ def main() -> int:
     S, n_overlap = stability_for_scene(
         images, poses, depths, K, dino_feats,
         window=args.window, device=args.device,
+        upstream_zero_invalid=args.upstream_zero,
     )
 
-    alpha = stability_to_alpha(S)
+    alpha = stability_to_alpha(S, thresh_movable=args.thresh_movable,
+                               thresh_static=args.thresh_static)
+    valid_mask = n_overlap >= args.min_overlap        # (N, H, W) bool
+
+    # ------------------------------------------------------------------
+    # Diagnostics: corner vs center stats. Corner = outer 5% border;
+    # center = inner 50% (radius). Reported only for VALID pixels.
+    # ------------------------------------------------------------------
+    border_w = max(1, int(W * 0.05)); border_h = max(1, int(H * 0.05))
+    corner_mask = np.zeros((H, W), dtype=bool)
+    corner_mask[:border_h, :] = True; corner_mask[-border_h:, :] = True
+    corner_mask[:, :border_w] = True; corner_mask[:, -border_w:] = True
+    yy, xx = np.mgrid[:H, :W]
+    cx_, cy_ = W / 2.0, H / 2.0
+    rad = np.sqrt(((xx - cx_) / (W/2))**2 + ((yy - cy_) / (H/2))**2)
+    center_mask = rad <= 0.5
+
+    valid_corner = valid_mask & corner_mask[None, ...]
+    valid_center = valid_mask & center_mask[None, ...]
+    n_corner = int(valid_corner.sum()); n_center = int(valid_center.sum())
+    if n_corner > 0:
+        red_corner = float((S[valid_corner] < args.thresh_movable).mean()) * 100.0
+        mean_S_corner = float(S[valid_corner].mean())
+    else:
+        red_corner = mean_S_corner = float("nan")
+    if n_center > 0:
+        red_center = float((S[valid_center] < args.thresh_movable).mean()) * 100.0
+        mean_S_center = float(S[valid_center].mean())
+    else:
+        red_center = mean_S_center = float("nan")
+    masked_pct = 100.0 * (1.0 - float(valid_mask.mean()))
+    print(f"[diag] tag={args.tag or '(none)'}  window=±{args.window}  "
+          f"min_overlap={args.min_overlap}  upstream_zero={args.upstream_zero}  "
+          f"thresh_mov={args.thresh_movable}  thresh_static={args.thresh_static}",
+          flush=True)
+    print(f"[diag] masked_pct={masked_pct:5.2f}%  "
+          f"corner_red%={red_corner:5.2f}  center_red%={red_center:5.2f}  "
+          f"mean_S_corner={mean_S_corner:.3f}  mean_S_center={mean_S_center:.3f}",
+          flush=True)
 
     # Save raw arrays for downstream / regression.
-    np.savez(out_dir / "stability.npz", S=S, alpha=alpha, n_overlap=n_overlap)
-    print(f"[save] {out_dir}/stability.npz  S min={S.min():.3f} max={S.max():.3f} mean={S.mean():.3f}", flush=True)
+    npz_path = out_dir / f"stability{suffix}.npz"
+    np.savez(npz_path,
+             S=S, alpha=alpha, n_overlap=n_overlap, valid_mask=valid_mask,
+             window=args.window, min_overlap=args.min_overlap,
+             upstream_zero=args.upstream_zero,
+             thresh_movable=args.thresh_movable,
+             thresh_static=args.thresh_static)
+    print(f"[save] {npz_path}  S min={S.min():.3f} max={S.max():.3f} mean={S.mean():.3f}",
+          flush=True)
 
     # Render videos.
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    s_path = out_dir / "stability.mp4"; a_path = out_dir / "alpha.mp4"
+    s_path = out_dir / f"stability{suffix}.mp4"
+    a_path = out_dir / f"alpha{suffix}.mp4"
+    o_path = out_dir / f"n_overlap{suffix}.mp4"
     s_w = cv2.VideoWriter(str(s_path), fourcc, args.fps, (W, H))
     a_w = cv2.VideoWriter(str(a_path), fourcc, args.fps, (W, H))
+    o_w = cv2.VideoWriter(str(o_path), fourcc, args.fps, (W, H))
+    n_max = max(1.0, float(n_overlap.max()))
     for i in range(N):
         bgr = cv2.cvtColor(images[i].transpose(1, 2, 0), cv2.COLOR_RGB2BGR)
         s_w.write(_heatmap_overlay(bgr, S[i]))
-        a_w.write(_alpha_overlay(bgr, alpha[i]))
-    s_w.release(); a_w.release()
-    print(f"[done] {s_path}\n[done] {a_path}", flush=True)
+        a_w.write(_alpha_overlay(bgr, alpha[i], mask=valid_mask[i]))
+        o_w.write(_heatmap_overlay(bgr, n_overlap[i] / n_max))
+    s_w.release(); a_w.release(); o_w.release()
+    print(f"[done] {s_path}\n[done] {a_path}\n[done] {o_path}", flush=True)
     return 0
 
 
