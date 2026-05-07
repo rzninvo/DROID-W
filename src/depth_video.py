@@ -105,6 +105,39 @@ class DepthVideo:
             self.dino_feats = None
             self.dino_feats_resize = None
 
+        # ── Goal C: external semantic dynamic-mask (HERMES-SLAM addition) ──
+        # Allocates a per-keyframe coarse-grid mask buffer when activated.
+        # Multiplied into BA weight in self.ba() following MegaSaM Eq. 2.
+        self.semantic_mask_aware = cfg.get('tracking', {}).get(
+            'semantic_mask', {}).get('activate', False)
+        if self.semantic_mask_aware:
+            self.dynamic_masks = torch.ones(
+                buffer, ht//self.down_scale, wd//self.down_scale,
+                device=self.device, dtype=torch.float
+            ).share_memory_()
+            self.semantic_mask_eps = float(cfg['tracking']['semantic_mask'].get('eps', 0.05))
+            # numpy array indexed by dataset frame idx (set via preload_dynamic_masks).
+            # Lives in main process; tracker child reads via fork-COW.
+            self._frame_dynamic_masks_full = None
+        else:
+            self.dynamic_masks = None
+            self.semantic_mask_eps = 0.0
+
+    def preload_dynamic_masks(self, frame_masks_full_res):
+        """Cache a per-frame full-resolution dynamic mask array.
+
+        Args:
+            frame_masks_full_res: numpy (N_frames, H, W) bool/float — 1=static,
+                0=dynamic. Indexed by dataset frame idx (== `tstamp` from
+                stream[i] in tracker.py:60).
+
+        Called once at SLAM start (slam.py) before the tracker subprocess forks.
+        Per-keyframe assignment happens later in __item_setter.
+        """
+        if not self.semantic_mask_aware:
+            return
+        self._frame_dynamic_masks_full = frame_masks_full_res
+
     def get_lock(self):
         return self.counter.get_lock()
 
@@ -166,7 +199,25 @@ class DepthVideo:
                     y_cdot = self.dino_feats_resize[index].permute(0, 2, 3, 1) @ self.affine_weights[:-1] + self.affine_weights[-1]
                     self.temp_y_cdot[index] = y_cdot
                     self.uncertainties[index] = torch.log(1.1 + torch.exp(y_cdot))
-                    
+
+        # ── Goal C: store the dynamic mask for this keyframe, looked up by
+        # dataset-frame idx (== item[0] = tstamp from tracker.py:67). Match the
+        # mono_disps/disps grid via the same strided slice convention used at
+        # line 129 — `[slice_h, slice_w]` — so kernel-side (i,j) coordinates
+        # of `weight` and `dynamic_masks` align exactly. ──
+        if self.semantic_mask_aware and self._frame_dynamic_masks_full is not None:
+            tstamp_idx = int(item[0])
+            if 0 <= tstamp_idx < len(self._frame_dynamic_masks_full):
+                m_full = self._frame_dynamic_masks_full[tstamp_idx]
+                m_full_t = torch.from_numpy(np.asarray(m_full, dtype=np.float32))
+                # Cropping: precompute mirrors the dataset's edge crop, so
+                # m_full_t is already at (ht, wd). Strided sample to coarse.
+                m_coarse = m_full_t[self.slice_h, self.slice_w]
+                self.dynamic_masks[index] = m_coarse.to(self.device)
+            else:
+                print(f"[WARN] semantic_mask: tstamp_idx {tstamp_idx} out of range "
+                      f"[0,{len(self._frame_dynamic_masks_full)}) — leaving mask=1.0",
+                      flush=True)
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -334,6 +385,17 @@ class DepthVideo:
 
             target = target.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
             weight = weight.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
+
+            # ── Goal C: external semantic-mask multiplicand on BA cost weight ──
+            # MegaSaM Eq. 2  (Li et al., CVPR 2025): w_tilde_ij = w_ij * m_i.
+            # `weight` enters droid_kernels.cu:326-327 as the SOLE per-pixel
+            # weight on the optical-flow residual; UDBA `1/scale_uncer` is then
+            # multiplied INTO this in the kernel (lines 331-336). Pre-multiplying
+            # `weight` here propagates correctly through the whole chain.
+            # ε floor preserves Hessian conditioning (no edge becomes singular).
+            if self.semantic_mask_aware and self.dynamic_masks is not None:
+                m = self.dynamic_masks[ii].clamp_min(self.semantic_mask_eps)  # [n_edges, h, w]
+                weight = weight * m[:, None, :, :]  # broadcast over (u, v) flow channels
 
             # if there is NaN of inf value for self.affine_weights, assert
             if self.uncertainty_aware:

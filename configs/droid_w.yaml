@@ -131,6 +131,19 @@ tracking:
     enable_affine_transform: True
     enable_bidirectional_uncer: False
 
+  # Goal C — external semantic dynamic-mask multiplied into the BA cost.
+  # Pattern: MegaSaM (Li et al., CVPR 2025) Eq. 2 — w_tilde_ij = w_ij * m_i, soft
+  # multiplicative attenuation at the same 1/8 BA grid as DROID-SLAM. Mask is
+  # PRECOMPUTED externally (tools/precompute_dynamic_masks.py with
+  # RADIO + SigLIP-2 + SAM-3) and loaded at SLAM start. Orthogonal to
+  # frontend.enable_opt_dyn_mask (which controls DROID-W's affine UDBA).
+  semantic_mask:
+    activate: False                  # default off (backwards-compat)
+    path: dynamic_masks.npz          # relative to data.input_folder, fallback save_dir
+    eps: 0.05                        # epsilon floor on m to preserve Hessian conditioning
+    queries: ["person"]              # used only by precompute script
+    sim_threshold: 0.40              # used only by precompute script
+
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 
