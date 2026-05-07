@@ -1,9 +1,0 @@
-inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
-scene: freiburg3_walking_static_mask
-
-# Goal C — turn on the external semantic dynamic-mask multiplicand.
-# Mask file lives next to the dataset (cfg.data.input_folder/dynamic_masks.npz),
-# precomputed once via tools/precompute_dynamic_masks.py.
-tracking:
-  semantic_mask:
-    activate: True

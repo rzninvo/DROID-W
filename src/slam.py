@@ -53,13 +53,6 @@ class SLAM:
         self.startup_barrier = None  # set in run() based on process count
 
         self.video = DepthVideo(cfg, self.printer)
-        # ── Goal C: load precomputed external dynamic mask BEFORE forks ──
-        # Numpy array lives in main process, fork-COW propagates to tracker
-        # subprocess. The shared-memory `dynamic_masks` tensor handles the
-        # tracker→BA hand-off. MUST run before `mp.Process(...)` calls in
-        # run().
-        self._maybe_load_semantic_masks(cfg, stream)
-
         self.ba = Backend(self.droid_net, self.video, self.cfg)
 
         # post processor - fill in poses for non-keyframes
@@ -75,56 +68,6 @@ class SLAM:
         self.mapper: Mapper = None
         self.stream = stream
         self.final_clean = False
-
-    def _maybe_load_semantic_masks(self, cfg, stream):
-        """Load precomputed external dynamic mask from disk and hand to
-        DepthVideo. Silent no-op when `tracking.semantic_mask.activate=False`.
-
-        Search order for the mask file (per CLAUDE.md §6 — log explicitly
-        what we did, no silent fallbacks):
-          1) <data.input_folder>/<semantic_mask.path>
-          2) <output>/<scene>/<semantic_mask.path>     (e.g. SLAM save_dir)
-        """
-        if not getattr(self.video, 'semantic_mask_aware', False):
-            return
-        sm_cfg = cfg.get('tracking', {}).get('semantic_mask', {})
-        rel_path = sm_cfg.get('path', 'dynamic_masks.npz')
-        from pathlib import Path as _Path
-        candidates = []
-        # Mirror BaseDataset's ROOT_FOLDER_PLACEHOLDER substitution
-        # (datasets.py:110-112) so the path resolves the same way SLAM resolves
-        # the dataset itself.
-        input_folder = cfg.get('data', {}).get('input_folder', '')
-        if input_folder and 'ROOT_FOLDER_PLACEHOLDER' in input_folder:
-            input_folder = input_folder.replace(
-                'ROOT_FOLDER_PLACEHOLDER', cfg['data'].get('root_folder', '.'))
-        if input_folder:
-            candidates.append(_Path(input_folder) / rel_path)
-        save_dir = f"{cfg['data']['output']}/{cfg['scene']}"
-        candidates.append(_Path(save_dir) / rel_path)
-        npz_path = next((p for p in candidates if p.exists()), None)
-        if npz_path is None:
-            print(f"[WARN] semantic_mask.activate=True but mask file not found in any of "
-                  f"{[str(p) for p in candidates]} — disabling semantic_mask "
-                  f"(SLAM proceeds without external mask).", flush=True)
-            self.video.semantic_mask_aware = False
-            return
-        masks_npz = np.load(str(npz_path))
-        if 'mask' not in masks_npz.files:
-            print(f"[WARN] semantic_mask: {npz_path} has no 'mask' field "
-                  f"(found {masks_npz.files}) — disabling.", flush=True)
-            self.video.semantic_mask_aware = False
-            return
-        masks = masks_npz['mask']  # (N_frames, H, W)
-        if masks.ndim != 3:
-            print(f"[WARN] semantic_mask: mask shape {masks.shape} is not 3D "
-                  f"(N, H, W) — disabling.", flush=True)
-            self.video.semantic_mask_aware = False
-            return
-        n_dyn = float((masks < 0.5).mean()) * 100.0
-        print(f"[INFO] semantic_mask: loaded {masks.shape} dtype={masks.dtype} "
-              f"from {npz_path}  ({n_dyn:.2f}% dynamic).", flush=True)
-        self.video.preload_dynamic_masks(masks)
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]

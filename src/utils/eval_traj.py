@@ -80,13 +80,10 @@ def align_full_traj(traj_est_full,stream,printer):
 
 def traj_eval_and_plot(traj_est, traj_ref, plot_parent_dir, plot_name,printer):
     import os
-    # Set matplotlib backend BEFORE evo.tools.plot imports it — evo's plot.py
-    # runs `mpl.use(SETTINGS.plot_backend)` (default TkAgg) at import time,
-    # which crashes on a headless server. Force Agg early.
-    import matplotlib
-    matplotlib.use('Agg')
     from evo.core import metrics
     from evo.tools import plot
+    import matplotlib
+    matplotlib.use('Agg')  # Avoid "Could not load the Qt platform" error
     import matplotlib.pyplot as plt
     if not os.path.exists(plot_parent_dir):
         os.makedirs(plot_parent_dir)
