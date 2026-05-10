@@ -27,13 +27,28 @@ loader (`slam.py:_maybe_load_semantic_masks`) finds it.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 from typing import List
 
+# CLAUDE.md §0 — pin determinism so re-runs produce bit-identical masks.
+# Required by Reviewer A audit (Report 17): mirrors the radseg-features pipeline
+# (precompute_radseg_features.py:45-56). CUBLAS_WORKSPACE_CONFIG must be set
+# BEFORE torch is imported so cuBLAS bmm in SCRA/SCGA becomes deterministic.
+# See https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
 import torch
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+try:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+except Exception:
+    pass
 
 # Allow `python scripts/...` from the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -160,11 +175,13 @@ def main() -> int:
         best_q = result["best_query"]         # (H, W) int
         best_score = result["best_score"]     # (H, W) float
 
-        # A pixel is DYNAMIC iff some query exceeds threshold AND that query's
-        # winning score is what argmax picked (i.e. the best query is one of
-        # ours and crosses threshold). Since `set_queries` was given exactly
-        # `queries`, every best_q ∈ [0, len(queries)). So just threshold on
-        # best_score.
+        # A pixel is DYNAMIC iff `best_score >= threshold`. RadioGrounder's
+        # `best_score` is the per-pixel softmax (after temperature-100 + prompt
+        # denoising + SAM-3 score-thresholding) of the argmax query in our
+        # `set_queries(queries)` list. Pixels below threshold or that fall to
+        # the implicit ignore class have `best_score == 0` (radio_grounding.py
+        # writes `sim_full[0]` = zeros for the ignore class), so the threshold
+        # comparison alone is sufficient — no separate `best_query >= 0` check.
         dyn = best_score >= threshold
 
         if cv2 is not None and dyn.any():
