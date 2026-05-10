@@ -55,7 +55,14 @@ def _compactness(mask: np.ndarray) -> float:
 
 
 def _hole_fraction(mask: np.ndarray) -> float:
-    """1 - area / convex_hull_area. 0 for a convex blob; up to 1 for ring shapes."""
+    """1 - area / convex_hull_area. 0 for a convex blob; up to 1 for ring shapes.
+
+    Reviewer 2 audit #4: cv2.contourArea uses a polygon approximation
+    that sometimes underestimates hull_area vs mask.sum (boundary
+    half-pixel accounting); the raw ratio can go slightly negative
+    (median was -0.012 on freiburg3). Clip to [0, 1] for a defensible
+    metric.
+    """
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
     if mask.sum() < 1:
@@ -63,14 +70,13 @@ def _hole_fraction(mask: np.ndarray) -> float:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return float("nan")
-    # Take largest contour for the hull.
     largest = max(contours, key=cv2.contourArea)
     hull = cv2.convexHull(largest)
     hull_area = float(cv2.contourArea(hull))
     area = float(mask.sum())
     if hull_area <= 0:
         return float("nan")
-    return float(1.0 - area / hull_area)
+    return float(np.clip(1.0 - area / hull_area, 0.0, 1.0))
 
 
 def _save_overlay(rgb: np.ndarray, masks_kf: list[np.ndarray], out_path: Path,

@@ -59,6 +59,7 @@ def pool_lang_features_in_mask(
     patch_size: int = 0,
     min_active_cells: int = 1,
     cell_overlap_thresh: float = 0.10,
+    min_weight_sum: float = 0.5,
 ) -> PoolResult:
     """Visibility-weighted average pool of `F_grid` over `mask`.
 
@@ -123,10 +124,13 @@ def pool_lang_features_in_mask(
     w_active = weights_flat[active].to(torch.float32)
     F_active = F_flat[:, active]                             # (D, n_active)
     weight_sum = float(w_active.sum().item())
-    if weight_sum <= 0:
+    # Reviewer 1 audit #7: tiny instances covering ~0.1 cell on the feat-grid
+    # pool from a single noisy feature; require min_weight_sum >= 0.5 (half a
+    # full feature cell of mask coverage) to commit to the pool.
+    if weight_sum < min_weight_sum:
         return PoolResult(
             feature=torch.zeros(D, dtype=torch.float32, device=device),
-            weight_sum=0.0, n_active_cells=n_active, is_empty=True,
+            weight_sum=weight_sum, n_active_cells=n_active, is_empty=True,
         )
     pooled = (F_active * w_active.unsqueeze(0)).sum(dim=1) / weight_sum   # (D,)
     pooled_norm = F.normalize(pooled, dim=0, eps=1e-8)

@@ -93,6 +93,16 @@ def _dedupe(masks: list[np.ndarray], scores: list[float],
 
 
 def _load_pca_basis(path: Path):
+    """Load the PCA basis we fit ourselves (Reviewer 2 #3: torch.load with
+    weights_only=False is a known pickle-CVE surface, but the basis file is
+    produced by `fit_pca_basis.py` on this same host and never pulled from
+    the network. Path-locality is our defense; we still log size+SHA so any
+    future on-host tampering is detectable in commit logs)."""
+    import hashlib
+    raw = Path(path).read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()[:16]
+    print(f"[basis] loading {path}  size={len(raw)/1024:.1f} KB  sha256[:16]={sha}",
+          flush=True)
     state = torch.load(str(path), map_location="cpu", weights_only=False)
     mean = state["mean"].numpy().astype(np.float32)             # (D,)
     components = state["components"].numpy().astype(np.float32)  # (target_dim, D)
@@ -115,7 +125,12 @@ def main() -> int:
     p.add_argument("--fastsam-iou", default=0.9, type=float)
     p.add_argument("--fastsam-imgsz", default=1024, type=int)
     p.add_argument("--sam3-score-thresh", default=0.5, type=float)
-    p.add_argument("--min-area", default=200, type=int)
+    p.add_argument("--min-area", default=200, type=int,
+                   help="Absolute pixel-area floor on instance masks.")
+    p.add_argument("--min-area-frac", default=0.0005, type=float,
+                   help="Relative pixel-area floor (Reviewer 1 #4 cross-scene "
+                        "consistency: TUM 480x640 vs Replica 1200x680 differ 2.7x). "
+                        "Effective min-area = max(min-area, min-area-frac * H*W).")
     p.add_argument("--max-instances-per-kf", default=80, type=int,
                    help="Hard cap; FastSAM occasionally produces >100 tiny masks.")
     p.add_argument("--dedupe-iou", default=0.92, type=float)
@@ -156,7 +171,12 @@ def main() -> int:
           f"patch_size={patch_size}  radio={radio_version}", flush=True)
 
     n_run = N_kf if args.max_kfs is None else min(args.max_kfs, N_kf)
+    # Effective min-area: paper-grade scale-aware floor (Reviewer 1 #4).
+    _min_area_eff = max(args.min_area, int(args.min_area_frac * H_img * W_img))
     print(f"[features] running B.1 on {n_run} KFs (max_kfs={args.max_kfs})", flush=True)
+    print(f"[features] min_area effective = {_min_area_eff} px (abs={args.min_area}, "
+          f"rel={args.min_area_frac:.4f}*{H_img*W_img}={int(args.min_area_frac*H_img*W_img)})",
+          flush=True)
 
     # ── Load images ────────────────────────────────────────────────────────
     video_path = feat_path.parent / "video.npz"
@@ -233,7 +253,7 @@ def main() -> int:
         # Filter by min_area on FastSAM mask.
         boxes = []
         for d in det:
-            if d.get("area", 0) < args.min_area:
+            if d.get("area", 0) < _min_area_eff:
                 continue
             box = d["box"]
             # Clip + sanity check.
@@ -277,7 +297,7 @@ def main() -> int:
                     n_out = seg.shape[0]
                     for k in range(n_out):
                         m_arr = (seg[k] > 0.5).astype(bool)
-                        if int(m_arr.sum()) < args.min_area:
+                        if int(m_arr.sum()) < _min_area_eff:
                             continue
                         sc = float(scores[k]) if scores is not None and len(scores) > k else float(args.sam3_score_thresh)
                         kf_masks.append(m_arr)
@@ -287,7 +307,7 @@ def main() -> int:
                         if lab <= 0:
                             continue
                         m_arr = (seg == lab).astype(bool)
-                        if int(m_arr.sum()) < args.min_area:
+                        if int(m_arr.sum()) < _min_area_eff:
                             continue
                         kf_masks.append(m_arr)
                         kf_scores.append(float(args.sam3_score_thresh))
@@ -313,12 +333,18 @@ def main() -> int:
             kf_areas.append(int(m_arr.sum()))
 
         # Append to scene-wide buffers.
+        # Reviewer 2 critical fix: store the GLOBAL dataset frame index
+        # (kf_global_indices[kf]), NOT the local KF position. On freiburg3
+        # both are 0..82 so it accidentally agreed; on Replica/ScanNet with
+        # stride>1 this would silently mislabel which dataset frame each
+        # instance came from — paper-wrong-numbers class bug.
+        global_idx = int(kf_global_indices[kf]) if kf < len(kf_global_indices) else int(kf)
         for m_arr, sc, e_pca, a in zip(kept_masks, kept_scores, kf_lang_emb_pca, kf_areas):
             all_masks.append(m_arr.astype(np.uint8))
             all_lang_emb.append(e_pca)
             all_scores.append(np.float16(sc))
             all_areas.append(a)
-            all_kf.append(int(kf))
+            all_kf.append(global_idx)
         per_kf_offsets.append(len(all_masks))
 
         if (kf + 1) % 5 == 0 or kf == 0 or kf == n_run - 1:
@@ -339,7 +365,10 @@ def main() -> int:
     # masks → fixed-shape (K, H, W) uint8.
     masks_arr = np.stack(all_masks, axis=0)
     lang_arr = np.stack(all_lang_emb, axis=0)
-    np.savez(
+    # Reviewer 1 #5 + Reviewer 2 #2: np.savez_compressed brings binary masks
+    # 20-30x smaller (634 MB → ~25 MB on freiburg3). At 8 Replica scenes the
+    # uncompressed total would have been ~5 GB; compressed ~150 MB.
+    np.savez_compressed(
         out_path,
         masks=masks_arr,
         lang_emb_pca=lang_arr,
