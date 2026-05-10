@@ -5,12 +5,38 @@ import time
 from collections import OrderedDict
 import torch.multiprocessing as mp
 
-# Avoid `pidfd_getfd: Operation not permitted` under kernel.yama.ptrace_scope=1
-# (default on recent Ubuntu kernels). PyTorch's default `file_descriptor` sharing
-# strategy uses pidfd_getfd to receive shared-memory FDs from sibling processes,
-# which the kernel rejects when ptrace_scope=1. `file_system` uses /dev/shm-backed
-# files instead — slightly slower per share but no kernel-permission dependency.
-# See https://github.com/pytorch/pytorch/issues/154566 for the upstream tracker.
+# ── Fix `pidfd_getfd: Operation not permitted` under kernel.yama.ptrace_scope=1 ──
+# Both CPU shared tensors AND CUDA shared tensors use pidfd_getfd in PyTorch 2.7
+# to inherit memory-handle FDs from the parent. With Yama scope=1, the child
+# (descendant) cannot ptrace the parent (ancestor) — only ancestors can ptrace
+# descendants by default. The fix is two-pronged:
+#   (a) PR_SET_PTRACER_ANY: parent declares any process may ptrace it, which
+#       lets the child's pidfd_getfd succeed for CUDA tensor IPC reductions.
+#   (b) file_system sharing strategy for CPU storages: avoids pidfd_getfd in
+#       the CPU storage path entirely (uses /dev/shm files instead).
+# Both apply at module import time, before any mp.Process is spawned.
+# Refs: https://man7.org/linux/man-pages/man2/pidfd_getfd.2.html — permission
+# governed by PTRACE_MODE_ATTACH_REALCREDS; pytorch/pytorch#154566 (upstream).
+import ctypes
+import ctypes.util as _ctypes_util
+_PR_SET_PTRACER = 0x59616d61
+_PR_SET_PTRACER_ANY = (1 << 64) - 1
+try:
+    _libc = ctypes.CDLL(_ctypes_util.find_library("c"), use_errno=True)
+    _libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                            ctypes.c_ulong, ctypes.c_ulong]
+    _libc.prctl.restype = ctypes.c_int
+    _ret = _libc.prctl(_PR_SET_PTRACER, _PR_SET_PTRACER_ANY, 0, 0, 0)
+    if _ret != 0:
+        _err = ctypes.get_errno()
+        print(f"[WARN] slam.py: prctl(PR_SET_PTRACER_ANY) returned {_ret} "
+              f"errno={_err} ({os.strerror(_err)}); CUDA mp tensors may fail "
+              f"with pidfd_getfd EPERM under kernel.yama.ptrace_scope=1.",
+              flush=True)
+except OSError as _e:
+    print(f"[WARN] slam.py: could not call prctl: {_e}; "
+          f"CUDA mp tensors may fail with pidfd_getfd EPERM under "
+          f"kernel.yama.ptrace_scope=1.", flush=True)
 mp.set_sharing_strategy("file_system")
 
 from munch import munchify
