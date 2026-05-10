@@ -20,6 +20,15 @@ import torch.multiprocessing as mp
 import ctypes
 import ctypes.util as _ctypes_util
 _PR_SET_PTRACER = 0x59616d61
+# `(unsigned long)-1` per Linux kernel headers — our target is x86_64 / aarch64
+# where c_ulong is 8 bytes. Fail loud if the assumption ever breaks (e.g. a
+# 32-bit port) so we don't silently truncate the prctl arg. Reviewer A audit,
+# Report 17 SHOULD-FIX #5.
+assert ctypes.sizeof(ctypes.c_ulong) == 8, (
+    f"slam.py: PR_SET_PTRACER_ANY assumes 64-bit c_ulong; this host has "
+    f"{ctypes.sizeof(ctypes.c_ulong)}-byte c_ulong. Update _PR_SET_PTRACER_ANY "
+    f"to (1 << 32) - 1 (or platform-appropriate) before continuing."
+)
 _PR_SET_PTRACER_ANY = (1 << 64) - 1
 try:
     _libc = ctypes.CDLL(_ctypes_util.find_library("c"), use_errno=True)
@@ -88,11 +97,13 @@ class SLAM:
         self.startup_barrier = None  # set in run() based on process count
 
         self.video = DepthVideo(cfg, self.printer)
-        # ── Goal C: load precomputed external dynamic mask BEFORE forks ──
-        # Numpy array lives in main process, fork-COW propagates to tracker
-        # subprocess. The shared-memory `dynamic_masks` tensor handles the
-        # tracker→BA hand-off. MUST run before `mp.Process(...)` calls in
-        # run().
+        # ── Goal C: load precomputed external dynamic mask BEFORE process spawn ──
+        # `run()` below uses `mp.set_start_method("spawn", force=True)`, so the
+        # tracker child reconstructs SLAM via pickle (NOT fork-COW). The numpy
+        # array `_frame_dynamic_masks_full` round-trips through pickle; the
+        # GPU twin `_frame_dynamic_masks_full_t` rides CUDA IPC alongside the
+        # other share_memory_()'d CUDA tensors. MUST run before any
+        # mp.Process(...) calls in run() so both are populated pre-pickle.
         self._maybe_load_semantic_masks(cfg, stream)
 
         self.ba = Backend(self.droid_net, self.video, self.cfg)
@@ -154,6 +165,17 @@ class SLAM:
         if masks.ndim != 3:
             print(f"[WARN] semantic_mask: mask shape {masks.shape} is not 3D "
                   f"(N, H, W) — disabling.", flush=True)
+            self.video.semantic_mask_aware = False
+            return
+        # Validate mask N matches stream length so a stale `dynamic_masks.npz`
+        # from a different cut can't silently apply (Reviewer 2 audit, Report 17).
+        # Tolerance of 1 covers the off-by-one from BaseDataset's edge crop.
+        n_stream = len(stream)
+        if abs(masks.shape[0] - n_stream) > 1:
+            print(f"[WARN] semantic_mask: mask N={masks.shape[0]} disagrees with "
+                  f"stream length {n_stream} by more than 1 — STALE FILE; refusing "
+                  f"to apply (re-run scripts/precompute_dynamic_masks.py for this "
+                  f"scene).", flush=True)
             self.video.semantic_mask_aware = False
             return
         n_dyn = float((masks < 0.5).mean()) * 100.0

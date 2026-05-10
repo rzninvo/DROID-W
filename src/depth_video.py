@@ -117,8 +117,15 @@ class DepthVideo:
             ).share_memory_()
             self.semantic_mask_eps = float(cfg['tracking']['semantic_mask'].get('eps', 0.05))
             # numpy array indexed by dataset frame idx (set via preload_dynamic_masks).
-            # Lives in main process; tracker child reads via fork-COW.
+            # Survives `mp.set_start_method("spawn")` via the child's pickle-rebuild
+            # of the SLAM object — NOT fork-COW (slam.py:run() forces spawn). The
+            # numpy array pickles cheaply; the GPU twin uses CUDA IPC.
             self._frame_dynamic_masks_full = None
+            # GPU-resident copy of the same masks (uploaded once at preload time
+            # to avoid M H2D PCIe roundtrips per batched __item_setter call;
+            # Reviewer A audit, Report 17 SHOULD-FIX #3). share_memory_()'d so it
+            # symmetrically rides the CUDA IPC handoff alongside `dynamic_masks`.
+            self._frame_dynamic_masks_full_t = None
         else:
             self.dynamic_masks = None
             self.semantic_mask_eps = 0.0
@@ -133,10 +140,27 @@ class DepthVideo:
 
         Called once at SLAM start (slam.py) before the tracker subprocess forks.
         Per-keyframe assignment happens later in __item_setter.
+
+        Performance: also uploads a float32 copy of the array to the SLAM
+        device once. Saves O(M_batch) per-call H2D copies in __item_setter
+        when trajectory_filler.py inserts non-keyframes in batches of up to 16.
         """
         if not self.semantic_mask_aware:
             return
         self._frame_dynamic_masks_full = frame_masks_full_res
+        # One-shot upload. ~580 MB on 32 GB GPU at 742×384×512 fp32 — tolerable.
+        # Could be fp16 / uint8 in a follow-up if memory matters more than the
+        # per-frame slice cost. For now, fp32 keeps the slice cheap.
+        arr = np.asarray(frame_masks_full_res, dtype=np.float32)
+        self._frame_dynamic_masks_full_t = torch.from_numpy(arr).to(self.device).share_memory_()
+        # Defensive: every later index op assumes same device as `dynamic_masks`.
+        # An accidental second device (post-fork CUDA-context oddness) would
+        # silently cross-copy via [slot] = m_coarse — slow but no error. Assert
+        # loud per CLAUDE.md §6 (Reviewer A SHOULD-FIX, Report 17).
+        assert self._frame_dynamic_masks_full_t.device == self.dynamic_masks.device, (
+            f"semantic_mask: device mismatch — full_t on {self._frame_dynamic_masks_full_t.device} "
+            f"but dynamic_masks on {self.dynamic_masks.device}"
+        )
 
     def get_lock(self):
         return self.counter.get_lock()
@@ -228,12 +252,15 @@ class DepthVideo:
                 pairs = [(index, int(tstamps_arg))]
             for slot, ts_idx in pairs:
                 if 0 <= ts_idx < n_full:
-                    m_full = self._frame_dynamic_masks_full[ts_idx]
-                    m_full_t = torch.from_numpy(np.asarray(m_full, dtype=np.float32))
+                    # GPU-resident lookup: indexes the preloaded
+                    # `_frame_dynamic_masks_full_t` (uploaded once in
+                    # preload_dynamic_masks per Reviewer A SHOULD-FIX #3).
+                    # No per-frame H2D copy.
+                    m_full_t = self._frame_dynamic_masks_full_t[ts_idx]
                     # Cropping: precompute mirrors the dataset's edge crop, so
                     # m_full_t is already at (ht, wd). Strided sample to coarse.
                     m_coarse = m_full_t[self.slice_h, self.slice_w]
-                    self.dynamic_masks[slot] = m_coarse.to(self.device)
+                    self.dynamic_masks[slot] = m_coarse
                 else:
                     print(f"[WARN] semantic_mask: tstamp_idx {ts_idx} out of range "
                           f"[0,{n_full}) at slot {slot} — leaving mask=1.0", flush=True)
@@ -412,6 +439,25 @@ class DepthVideo:
             # multiplied INTO this in the kernel (lines 331-336). Pre-multiplying
             # `weight` here propagates correctly through the whole chain.
             # ε floor preserves Hessian conditioning (no edge becomes singular).
+            #
+            # DIVERGENCE FROM MegaSaM Eq. 2 — direct path only.
+            # `weight` (mask-attenuated) is consumed directly by
+            # `projective_transform_kernel` (droid_kernels.cu). The
+            # `dino_feats_projective_transform_kernel` does NOT take `weight`
+            # as a parameter, so the mask is not directly threaded there.
+            #
+            # IMPORTANT (Reviewer 2 audit, Report 17): the kernel computes
+            # `wu *= w_uncer` where `w_uncer = 1/scale_uncer` and
+            # `scale_uncer` is derived from `self.uncertainties[ix][i][j]`
+            # (kernels lines 331-336). When `enable_udba=True`, BA's gradient
+            # flow updates `uncertainties` based on residuals, so masking
+            # `weight` *indirectly* affects what UDBA learns — but only
+            # through the optimization residuals, not as a separate
+            # multiplicand on the dino-feature path. This is acceptable for
+            # our use (the SAM-3 mask is fixed external input, not a learned
+            # parameter), but the asymmetry should be noted in the paper's
+            # methodology section: we apply MegaSaM-style attenuation only
+            # to the geometric-flow data term.
             if self.semantic_mask_aware and self.dynamic_masks is not None:
                 m = self.dynamic_masks[ii].clamp_min(self.semantic_mask_eps)  # [n_edges, h, w]
                 weight = weight * m[:, None, :, :]  # broadcast over (u, v) flow channels
