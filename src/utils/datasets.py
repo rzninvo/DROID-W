@@ -304,6 +304,18 @@ class ScanNet(BaseDataset):
     ScanNet scene (Plan B's eval scope is Replica + freiburg3 only). When you
     add ScanNet to the eval, run `scripts/verify_dataset_loader.py` first."""
     def __init__(self, cfg, device='cuda:0'):
+        # Reviewer-2 audit #6: registering an unverified loader is a CLAUDE.md §0
+        # landmine — silent corruption if used. Gate construction behind an
+        # explicit env var so a future user must opt-in (and presumably run the
+        # verifier first).
+        if not os.environ.get("DROIDW_ALLOW_UNVERIFIED_SCANNET"):
+            raise RuntimeError(
+                "ScanNet loader has not been validated by "
+                "scripts/verify_dataset_loader.py on a real ScanNet scene "
+                "(Plan B's eval scope is Replica + freiburg3 only). To use "
+                "anyway after running the verifier, export "
+                "DROIDW_ALLOW_UNVERIFIED_SCANNET=1. See Report 18 B.0."
+            )
         super(ScanNet, self).__init__(cfg, device)
         stride = cfg['stride']
         max_frames = cfg['max_frames']

@@ -1,21 +1,44 @@
 """
-B.0 — verify dataset loader correctness via self-reprojection.
+B.0 — verify dataset loader correctness via self- + cross-frame reprojection.
 
-For 5 random frames from a scene loaded through the canonical
-`get_dataset(cfg)` path: project all valid pixels through depth + intrinsics
-to camera-frame XYZ, transform to world, transform back to camera, project
-to pixel. Should return original (u, v) within sub-pixel error if the loader's
-(K, depth_scale, pose convention) form a self-consistent triple.
+Two tests, both must PASS:
 
-Aborts with [FAIL] if median per-frame pixel error > 5 px on any frame.
-Passes if median ≤ 3 px on all 5 frames (paper-grade gate).
+  1. SELF-REPROJECTION (sanity).
+     For 5 random frames: project all valid pixels through depth + K to camera
+     XYZ, transform to world via pose_c2w, back to camera via inv(pose_c2w),
+     project to (u, v). Should return identity within sub-pixel error.
+     Catches: arithmetic bugs, NaN/Inf in poses, wrong tensor shapes.
+     Does NOT catch: wrong K, wrong depth_scale, sign-flipped pose convention
+     (these all cancel under a self-consistent round-trip).
 
-This catches:
-  • wrong png_depth_scale (depth too small/big → reprojected points on the
-    wrong ray → wrong (u', v')).
-  • pose convention sign flip (w2c where c2w expected, etc.).
-  • wrong cx/cy (pixel offset = (cx_used - cx_true)).
-  • wrong fx/fy (axis-aligned magnification of the residual error).
+  2. CROSS-FRAME DEPTH CONSISTENCY (the actual gate, per Reviewer-2 audit).
+     Fixed small-parallax pairs (0,5), (50,55), (500,505), (1000,1005),
+     (1500,1505) — 5-frame baseline preserves >50% of frame i in-bounds and
+     exercises near-field parallax sensitive to fx/fy. For each pair (i, j):
+     project depth_i to world, then to image_j, look up depth_j at predicted
+     pixel, check predicted z (cam_j) ≈ observed z. Median rel-err <= 2%
+     AND p95 rel-err <= 10% required.
+     Catches: pose-convention sign flips, wrong depth_scale (would diverge
+     across non-trivial baselines), wrong (fx, fy) (parallax-dependent).
+
+Reviewer-2 audit (Report 18 B.0) hardenings:
+  #1  Single source-of-truth gate threshold (was 2%/5%/5% inconsistently).
+  #2/#3  z>0 + isfinite guards before division (catches sign-flipped poses
+         that would otherwise silently produce huge-finite garbage).
+  #4  Small-parallax fixed pairs (was random-then-consecutive — produced
+      [178→866] with only 0.4% of frame i in-bounds).
+  #5  Loader-shape drift assertion in `_scene_intrinsic`.
+  #7  p95 secondary gate (median is blind to mid-magnitude depth_scale errors
+      masked by dynamic-scene tails).
+
+NOT TESTED HERE (open issue from Reviewer 2 #8, Report 18 B.0):
+  Pose-convention FALSIFICATION (OpenGL c2w vs OpenCV c2w). Both pass under
+  a self-consistent round-trip + cross-frame test because both are c2w; the
+  test only proves c2w (not w2c). Distinguishing OpenGL from OpenCV requires
+  an external anchor — e.g., project the GT mesh into image i and compare
+  RGB photometrically, or check pose[:3,1] gravity direction against scene
+  prior. Plan B B.5 must audit downstream BA / RADIO consumers for handedness
+  consistency before publication.
 
 Usage:
     python scripts/verify_dataset_loader.py \\
@@ -48,16 +71,25 @@ from src import config as droid_config
 from src.utils.datasets import get_dataset
 
 
-def _scene_intrinsic(stream) -> tuple[float, float, float, float, int, int]:
+def _scene_intrinsic(stream, sample_depth_shape: tuple[int, int]) -> tuple[float, float, float, float, int, int]:
     """Read the post-crop / post-resize intrinsic from the BaseDataset instance.
-    These match the (color, depth) tensors that __getitem__ returns."""
+    These match the (color, depth) tensors that __getitem__ returns.
+
+    Reviewer-2 audit fix #5: assert the loader's reported H/W match an actual
+    depth tensor's shape. Catches loader-shape drift (resize / crop config
+    drift) before it silently mis-tests downstream reprojection math.
+    """
     fx = float(stream.fx)
     fy = float(stream.fy)
     cx = float(stream.cx)
     cy = float(stream.cy)
-    # Post-edge-crop output dims
     H_out = int(stream.H_out_with_edge - 2 * stream.H_edge)
     W_out = int(stream.W_out_with_edge - 2 * stream.W_edge)
+    H_d, W_d = sample_depth_shape
+    assert (H_out, W_out) == (H_d, W_d), (
+        f"loader-shape drift: stream reports {(H_out, W_out)} but depth tensor "
+        f"is {sample_depth_shape}; verifier math would silently mis-test"
+    )
     return fx, fy, cx, cy, H_out, W_out
 
 
@@ -151,18 +183,24 @@ def _self_reprojection_error(depth: np.ndarray, fx: float, fy: float,
     cam_back = pose_w2c @ world                                # (4, H*W)
 
     z_back = cam_back[2]
-    u_back = fx * cam_back[0] / z_back + cx
-    v_back = fy * cam_back[1] / z_back + cy
+    # Reviewer-2 audit fix #3: guard z>0 + finite BEFORE division so a
+    # sign-flipped pose can't silently produce huge-finite garbage.
+    safe = (z_back > min_depth) & np.isfinite(z_back)
+    u_back = np.full_like(z_back, np.nan)
+    v_back = np.full_like(z_back, np.nan)
+    u_back[safe] = fx * cam_back[0][safe] / z_back[safe] + cx
+    v_back[safe] = fy * cam_back[1][safe] / z_back[safe] + cy
     u_back = u_back.reshape(H, W)
     v_back = v_back.reshape(H, W)
     z_back = z_back.reshape(H, W)
 
     err = np.sqrt((u_back - u) ** 2 + (v_back - v) ** 2)
-    err_valid = err[valid]
+    err_valid = err[valid & np.isfinite(err)]
     in_bounds = (
         (u_back[valid] >= 0) & (u_back[valid] < W) &
         (v_back[valid] >= 0) & (v_back[valid] < H) &
-        (np.abs(z_back[valid] - z[valid]) < 1e-3)
+        (np.abs(z_back[valid] - z[valid]) < 1e-3) &
+        np.isfinite(u_back[valid]) & np.isfinite(v_back[valid])
     )
     return {
         "n_valid_px": int(valid.sum()),
@@ -178,26 +216,40 @@ def main() -> int:
     p.add_argument("--config", required=True, type=str,
                    help="Scene config yaml (with full inherit_from chain).")
     p.add_argument("--n-frames", default=5, type=int,
-                   help="Number of random frames to test.")
+                   help="Number of random frames to test (self-reproj only).")
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--gate-median-px", default=3.0, type=float,
                    help="PASS if median pixel error <= this on every frame.")
     p.add_argument("--abort-median-px", default=5.0, type=float,
                    help="FAIL hard if any frame median error > this.")
+    p.add_argument("--gate-cross-rel", default=0.02, type=float,
+                   help="Cross-frame median relative depth-error gate (Reviewer-2 #1: "
+                        "default tightened to 2%% — was inconsistently 2%/5%/5% across "
+                        "code/comment/print before).")
+    p.add_argument("--gate-cross-p95", default=0.10, type=float,
+                   help="Cross-frame p95 relative depth-error gate (Reviewer-2 #7: "
+                        "median-only is blind to mid-magnitude errors).")
+    p.add_argument("--gate-cross-min-overlap-pct", default=20.0, type=float,
+                   help="Reviewer-2 #4: each cross-frame pair must have >=this %% of "
+                        "frame-i pixels reproject in-bounds, else the pair is "
+                        "dismissed as too-large-baseline (statistically meaningless).")
     args = p.parse_args()
 
     cfg = droid_config.load_config(args.config)
     stream = get_dataset(cfg)
     n_total = len(stream)
     print(f"[setup] config={args.config}  n_frames_total={n_total}", flush=True)
-    fx, fy, cx, cy, H_out, W_out = _scene_intrinsic(stream)
+    # Probe one frame to discover depth shape; pass to intrinsic check.
+    _, _, _probe_depth, _ = stream[0]
+    probe_shape = (_probe_depth.shape[-2], _probe_depth.shape[-1])
+    fx, fy, cx, cy, H_out, W_out = _scene_intrinsic(stream, probe_shape)
     print(f"[setup] post-crop K  fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}  HxW={H_out}x{W_out}",
           flush=True)
     print(f"[setup] png_depth_scale={stream.png_depth_scale}", flush=True)
 
     rng = np.random.default_rng(args.seed)
     idxs = rng.choice(n_total, size=min(args.n_frames, n_total), replace=False)
-    print(f"[setup] sampled frames: {sorted(idxs.tolist())}\n", flush=True)
+    print(f"[setup] sampled frames (self-reproj): {sorted(idxs.tolist())}\n", flush=True)
 
     fail = False
     pass_count = 0
@@ -254,13 +306,19 @@ def main() -> int:
 
     print(f"\n=== self-reproj summary ===  passed={pass_count}/{len(idxs)}  hard_fail={fail}", flush=True)
 
-    # ── Cross-frame reprojection (Reviewer A audit, Report 18 B.0):
-    # self-reproj alone is mathematical identity and cannot detect c2w/w2c
-    # flips, wrong depth_scale, or wrong K vs scene-truth. Cross-frame depth
-    # consistency on a static-scene pair catches all three. ─────────────────
-    print(f"\n=== cross-frame depth-consistency (Reviewer A required) ===", flush=True)
-    sorted_idxs = sorted(idxs.tolist())
-    cross_pairs = list(zip(sorted_idxs[:-1], sorted_idxs[1:]))
+    # ── Cross-frame reprojection (Reviewer-2 audit fix #4 + #7) ──────────
+    # Pre-tightening: random-sample-then-consecutive-pair gave [178→866] with
+    # only 2961 pixels (0.4% of frame) — statistically meaningless and biased
+    # toward the far-plane subset most tolerant to pose error. Now uses fixed
+    # SMALL-PARALLAX pairs (5-frame baseline) → preserves >50% of frame i in
+    # bounds, exercises near-field parallax which is sensitive to fx/fy.
+    SMALL_PARALLAX_OFFSETS = [(0, 5), (50, 55), (500, 505), (1000, 1005), (1500, 1505)]
+    cross_pairs = [(i, j) for (i, j) in SMALL_PARALLAX_OFFSETS
+                   if i < n_total and j < n_total]
+    print(f"\n=== cross-frame depth-consistency (small-parallax fixed pairs) ===", flush=True)
+    print(f"  pairs={cross_pairs}  median-gate={args.gate_cross_rel*100:.1f}%  "
+          f"p95-gate={args.gate_cross_p95*100:.1f}%  min-overlap={args.gate_cross_min_overlap_pct:.0f}%",
+          flush=True)
     cross_fail = False
     for i, j in cross_pairs:
         item_i = stream[int(i)]
@@ -286,16 +344,30 @@ def main() -> int:
             print(f"  [{i} → {j}] FAIL  no usable cross-frame pixels  in_bounds={ib:.1f}%", flush=True)
             cross_fail = True
             continue
-        # Strict gate: 2% median relative depth error (paper-grade for static scenes).
-        if med > 0.05:
-            print(f"  [{i} → {j}] FAIL  median_rel={med*100:.2f}% (>5% gate)  p95_rel={p95*100:.2f}%  "
-                  f"n_valid={nv} n_occluded={nocc} in_bounds={ib:.1f}%", flush=True)
+        # Reviewer-2 audit #4: reject pairs whose overlap is too small to be
+        # a meaningful test (less than min-overlap-pct of frame-i pixels in-bounds).
+        if ib < args.gate_cross_min_overlap_pct:
+            print(f"  [{i} → {j}] SKIP  in_bounds={ib:.1f}% < gate {args.gate_cross_min_overlap_pct:.0f}%  "
+                  f"(too-large baseline; not a meaningful test)", flush=True)
+            continue
+        # Reviewer-2 audit #1+#7: aligned median + p95 gates.
+        med_pct = med * 100
+        p95_pct = p95 * 100
+        med_fail = med > args.gate_cross_rel
+        p95_fail = p95 > args.gate_cross_p95
+        if med_fail or p95_fail:
+            tag = "FAIL"
+            if med_fail and p95_fail:
+                why = f"median>{args.gate_cross_rel*100:.1f}% AND p95>{args.gate_cross_p95*100:.1f}%"
+            elif med_fail:
+                why = f"median>{args.gate_cross_rel*100:.1f}%"
+            else:
+                why = f"p95>{args.gate_cross_p95*100:.1f}%"
+            print(f"  [{i} → {j}] {tag}  median_rel={med_pct:.2f}%  p95_rel={p95_pct:.2f}%  "
+                  f"n_valid={nv} n_occluded={nocc} in_bounds={ib:.1f}%  ({why})", flush=True)
             cross_fail = True
-        elif med > 0.02:
-            print(f"  [{i} → {j}] WARN  median_rel={med*100:.2f}% (>2% soft)  p95_rel={p95*100:.2f}%  "
-                  f"n_valid={nv} n_occluded={nocc} in_bounds={ib:.1f}%", flush=True)
         else:
-            print(f"  [{i} → {j}] PASS  median_rel={med*100:.2f}%  p95_rel={p95*100:.2f}%  "
+            print(f"  [{i} → {j}] PASS  median_rel={med_pct:.2f}%  p95_rel={p95_pct:.2f}%  "
                   f"n_valid={nv} n_occluded={nocc} in_bounds={ib:.1f}%", flush=True)
 
     if fail or cross_fail:
