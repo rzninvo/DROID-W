@@ -4,6 +4,15 @@ import numpy as np
 import time
 from collections import OrderedDict
 import torch.multiprocessing as mp
+
+# Avoid `pidfd_getfd: Operation not permitted` under kernel.yama.ptrace_scope=1
+# (default on recent Ubuntu kernels). PyTorch's default `file_descriptor` sharing
+# strategy uses pidfd_getfd to receive shared-memory FDs from sibling processes,
+# which the kernel rejects when ptrace_scope=1. `file_system` uses /dev/shm-backed
+# files instead — slightly slower per share but no kernel-permission dependency.
+# See https://github.com/pytorch/pytorch/issues/154566 for the upstream tracker.
+mp.set_sharing_strategy("file_system")
+
 from munch import munchify
 
 from src.modules.droid_net import DroidNet
