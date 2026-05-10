@@ -66,7 +66,11 @@ from src.utils.mono_priors.radseg.radseg_encoder import RADSegEncoder
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--scene", required=True, type=Path)
+    p.add_argument("--scene", default=None, type=Path,
+                   help="Scene directory containing video.npz (legacy path; preferred for TUM/YouTube scenes).")
+    p.add_argument("--config", default=None, type=str,
+                   help="Scene config (NEW; for Replica/ScanNet scenes that "
+                        "stream from BaseDataset rather than ship a video.npz).")
     p.add_argument("--radio-version", default="c-radio_v4-h", type=str)
     p.add_argument("--lang-adaptor", default=None, type=str,
                    help="Auto-detected from --radio-version when omitted "
@@ -84,12 +88,29 @@ def main() -> int:
                         "(query_radseg_features.py applies its own at query time).")
     args = p.parse_args()
 
-    scene = args.scene.resolve()
-    npz_path = scene / "video.npz"
-    if not npz_path.exists():
-        print(f"[ERR] {npz_path} not found", flush=True)
+    if (args.scene is None) == (args.config is None):
+        print(f"[ERR] specify exactly one of --scene <dir> or --config <yaml>", flush=True)
         return 1
-    out_path = args.output.resolve() if args.output is not None else scene / "radseg_features.npz"
+    if args.scene is not None:
+        scene = args.scene.resolve()
+        npz_path = scene / "video.npz"
+        if not npz_path.exists():
+            print(f"[ERR] {npz_path} not found", flush=True)
+            return 1
+        out_path = args.output.resolve() if args.output is not None else scene / "radseg_features.npz"
+        stream_mode = "video.npz"
+        cfg = None
+    else:
+        # Config-driven path: stream from BaseDataset (Replica / ScanNet).
+        from src import config as droid_config
+        cfg = droid_config.load_config(args.config)
+        # Output dir: <data.output>/<scene>/radseg_features.npz
+        scene_name = cfg.get("scene", "scene")
+        scene = Path(cfg["data"]["output"]) / scene_name
+        scene.mkdir(parents=True, exist_ok=True)
+        npz_path = None
+        out_path = args.output.resolve() if args.output is not None else scene / "radseg_features.npz"
+        stream_mode = f"BaseDataset({cfg['dataset']})"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     is_v4 = "v4" in args.radio_version.lower()
@@ -102,17 +123,47 @@ def main() -> int:
     print(f"[setup] radio={args.radio_version}  lang_adaptor={lang_adaptor}", flush=True)
     print(f"[setup] output={out_path}", flush=True)
 
-    z = np.load(npz_path)
-    if "images" not in z.files:
-        print(f"[ERR] {npz_path} has no 'images' field", flush=True)
-        return 1
-    images = z["images"]
-    if images.dtype != np.uint8:
-        images = (images * 255.0).clip(0, 255).astype(np.uint8)
-    N_full, _, H, W = images.shape
-    if N_full == 0:
-        print(f"[ERR] {npz_path} has 0 keyframes — nothing to ground", flush=True)
-        return 1
+    if stream_mode == "video.npz":
+        z = np.load(npz_path)
+        if "images" not in z.files:
+            print(f"[ERR] {npz_path} has no 'images' field", flush=True)
+            return 1
+        images = z["images"]
+        if images.dtype != np.uint8:
+            images = (images * 255.0).clip(0, 255).astype(np.uint8)
+        N_full, _, H, W = images.shape
+        if N_full == 0:
+            print(f"[ERR] {npz_path} has 0 keyframes — nothing to ground", flush=True)
+            return 1
+        # Mapping local-KF → global-frame is identity in legacy-video.npz mode.
+        kf_global_indices = np.arange(N_full, dtype=np.int64)
+    else:
+        # Stream from dataset.
+        from src.utils.datasets import get_dataset
+        stream = get_dataset(cfg)
+        N_full = len(stream)
+        if N_full == 0:
+            print(f"[ERR] BaseDataset({cfg['dataset']}) returned 0 frames", flush=True)
+            return 1
+        # Probe first frame for H, W.
+        _, color0, _, _ = stream[0]
+        if torch.is_tensor(color0):
+            color0 = color0.cpu().numpy()
+        if color0.ndim == 4:
+            color0 = color0[0]
+        H, W = color0.shape[1], color0.shape[2]
+        # Map local-KF idx → global dataset frame idx (after stride).
+        cfg_stride = int(cfg.get("stride", 1)) if cfg else 1
+        cfg_max_frames = int(cfg.get("max_frames", -1)) if cfg else -1
+        # Build kf_global_indices that mirrors Replica.__init__'s
+        #   color_paths[:max_frames][::stride]   (datasets.py:273-275)
+        if cfg_max_frames < 0:
+            kf_global_indices = np.arange(0, N_full * cfg_stride, cfg_stride, dtype=np.int64)
+        else:
+            kf_global_indices = np.arange(0, cfg_max_frames, cfg_stride, dtype=np.int64)[:N_full]
+        images = None  # streamed lazily below
+        print(f"[setup] streaming N_full={N_full} frames at H={H} W={W} from {stream_mode}",
+              flush=True)
     if args.max_keyframes is not None:
         if args.max_keyframes >= N_full:
             print(f"[WARN] features: --max-keyframes={args.max_keyframes} >= "
@@ -122,7 +173,9 @@ def main() -> int:
             N = args.max_keyframes
     else:
         N = N_full
-    images = images[:N]
+    if stream_mode == "video.npz":
+        images = images[:N]
+    # else: streaming path, _get_image_uint8(i) handles range below.
     print(f"[setup] N_keyframes={N}/{N_full}  image (H,W)=({H},{W})", flush=True)
 
     # Build encoder in feature-extraction-only mode (no SAM, no class
@@ -147,8 +200,21 @@ def main() -> int:
     print(f"[load] encoder ready in {time.time() - t_load:.1f}s "
           f"(patch={encoder.model.patch_size})", flush=True)
 
+    # Helper to fetch image i as (3, H, W) uint8 — works for both modes.
+    def _get_image_uint8(i: int) -> np.ndarray:
+        if stream_mode == "video.npz":
+            return images[i]
+        else:
+            _, color, _, _ = stream[i]
+            if torch.is_tensor(color):
+                color = color.cpu().numpy()
+            if color.ndim == 4:
+                color = color[0]
+            return (color * 255.0).clip(0, 255).astype(np.uint8)  # (3, H, W) uint8
+
     # Probe one keyframe to learn the feature grid + lang-aligned dim.
-    img0 = torch.from_numpy(images[0]).float() / 255.0  # (3, H, W)
+    img0_np = _get_image_uint8(0)
+    img0 = torch.from_numpy(img0_np).float() / 255.0  # (3, H, W)
     img0 = img0.unsqueeze(0).to(args.device)
     with torch.no_grad():
         feat0 = encoder.encode_image_to_feat_map(img0)             # (1, C_radio, h, w)
@@ -156,13 +222,13 @@ def main() -> int:
     _, D, hp, wp = aligned0.shape
     print(f"[setup] feat grid (h,w)=({hp},{wp})  lang-aligned dim D={D}", flush=True)
 
-    # Allocate output buffer on CPU. fp16 is enough for cosine quality
-    # (we'll re-normalize at query time).
+    # Allocate output buffer on CPU. fp16 is enough for cosine quality.
     feats_cpu = np.zeros((N, D, hp, wp), dtype=np.float16)
 
     t_loop = time.time()
     for i in range(N):
-        img = torch.from_numpy(images[i]).float() / 255.0
+        img_np = _get_image_uint8(i)
+        img = torch.from_numpy(img_np).float() / 255.0
         img = img.unsqueeze(0).to(args.device)
         with torch.no_grad():
             f = encoder.encode_image_to_feat_map(img)              # (1, C_radio, h, w)
@@ -194,7 +260,13 @@ def main() -> int:
         n_keyframes_in_video=np.int64(N_full),
         image_hw=np.asarray([H, W], dtype=np.int64),
         feat_hw=np.asarray([hp, wp], dtype=np.int64),
+        # kf_indices stores the LOCAL KF position within this scene's
+        # `radseg_features.npz` — useful for offsets. The mapping to the
+        # original dataset frame index is `kf_global_indices` (added per
+        # Reviewer-2 audit, B.0 plan #B0): identity for legacy video.npz
+        # mode, true global indices for streaming-from-dataset mode.
         kf_indices=np.arange(N, dtype=np.int64),
+        kf_global_indices=kf_global_indices[:N].astype(np.int64),
         walltime_seconds=np.float32(walltime),
     )
     size_mb = out_path.stat().st_size / 1024 / 1024

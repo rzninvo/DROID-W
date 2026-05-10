@@ -3,12 +3,17 @@ inherit_from: ./configs/droid_w.yaml
 dataset: 'replica'
 scene: room0
 
+# Phase B' / B.1 stride: 2000 frames -> 200 KFs. Replica's mesh-vertex GT
+# (used by B.5 OVO-SLAM-style mIoU) doesn't need per-frame coverage — every
+# 10th frame projects enough viewpoints to cover all visible vertices.
+# Read at top-level by Replica.__init__ (see datasets.py:262).
+stride: 10
+max_frames: -1
+
 data:
   root_folder: /home/cvg/datasets/Replica/Replica
   input_folder: /home/cvg/datasets/Replica/Replica/room0
   output: ./Outputs/Replica
-  stride: 1
-  max_frames: -1
 
 cam:
   # NICE-SLAM-rendered Replica intrinsics (canonical for the cvg-data.inf.ethz.ch
