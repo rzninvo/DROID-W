@@ -204,20 +204,39 @@ class DepthVideo:
         # dataset-frame idx (== item[0] = tstamp from tracker.py:67). Match the
         # mono_disps/disps grid via the same strided slice convention used at
         # line 129 — `[slice_h, slice_w]` — so kernel-side (i,j) coordinates
-        # of `weight` and `dynamic_masks` align exactly. ──
+        # of `weight` and `dynamic_masks` align exactly.
+        #
+        # Two callers reach this path:
+        #   (1) tracker.py — single-keyframe insertion: index=int, item[0]=int
+        #       or 0-d tensor.
+        #   (2) trajectory_filler.py:78 — batched non-keyframe insertion for
+        #       full-trajectory pose interpolation: index=slice(N, N+M),
+        #       item[0]=tensor of shape (M,). Without batched handling here,
+        #       int(item[0]) raises "only one element tensors..." and the
+        #       full-traj eval crashes after the main SLAM loop succeeds. ──
         if self.semantic_mask_aware and self._frame_dynamic_masks_full is not None:
-            tstamp_idx = int(item[0])
-            if 0 <= tstamp_idx < len(self._frame_dynamic_masks_full):
-                m_full = self._frame_dynamic_masks_full[tstamp_idx]
-                m_full_t = torch.from_numpy(np.asarray(m_full, dtype=np.float32))
-                # Cropping: precompute mirrors the dataset's edge crop, so
-                # m_full_t is already at (ht, wd). Strided sample to coarse.
-                m_coarse = m_full_t[self.slice_h, self.slice_w]
-                self.dynamic_masks[index] = m_coarse.to(self.device)
+            tstamps_arg = item[0]
+            n_full = len(self._frame_dynamic_masks_full)
+            if torch.is_tensor(tstamps_arg) and tstamps_arg.numel() > 1:
+                M = tstamps_arg.numel()
+                if isinstance(index, slice):
+                    slot_start = index.start if index.start is not None else 0
+                else:
+                    slot_start = int(index[0]) if torch.is_tensor(index) else int(index)
+                pairs = [(slot_start + k, int(tstamps_arg[k])) for k in range(M)]
             else:
-                print(f"[WARN] semantic_mask: tstamp_idx {tstamp_idx} out of range "
-                      f"[0,{len(self._frame_dynamic_masks_full)}) — leaving mask=1.0",
-                      flush=True)
+                pairs = [(index, int(tstamps_arg))]
+            for slot, ts_idx in pairs:
+                if 0 <= ts_idx < n_full:
+                    m_full = self._frame_dynamic_masks_full[ts_idx]
+                    m_full_t = torch.from_numpy(np.asarray(m_full, dtype=np.float32))
+                    # Cropping: precompute mirrors the dataset's edge crop, so
+                    # m_full_t is already at (ht, wd). Strided sample to coarse.
+                    m_coarse = m_full_t[self.slice_h, self.slice_w]
+                    self.dynamic_masks[slot] = m_coarse.to(self.device)
+                else:
+                    print(f"[WARN] semantic_mask: tstamp_idx {ts_idx} out of range "
+                          f"[0,{n_full}) at slot {slot} — leaving mask=1.0", flush=True)
 
     def __setitem__(self, index, item):
         with self.get_lock():
