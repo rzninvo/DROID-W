@@ -138,6 +138,13 @@ def main() -> int:
                    help="3D merge: cos(e_A, e_B) gate (OVI-MAP §3.3).")
     p.add_argument("--merge-voxel-iou-thresh", default=0.30, type=float,
                    help="3D merge: voxel-IoU gate (OVI-MAP §3.3).")
+    p.add_argument("--merge-max-cooccurrence", default=2, type=int,
+                   help="Temporal-disjointness gate (HERMES-SLAM): two tracks that "
+                        "co-occur in MORE than this many KFs cannot be the same "
+                        "physical entity, so the merge is forbidden regardless of "
+                        "cosine and voxel-IoU. Catches the same-class spatial-overlap "
+                        "failure mode (e.g. two persons in one frame both pulled into "
+                        "id=1). Default 2 = allow occasional spurious double-detections.")
     p.add_argument("--voxel-size", default=0.05, type=float,
                    help="Voxel grid (m). 5 cm matches OVI-MAP / ConceptGraphs.")
     p.add_argument("--min-track-kf-count", default=3, type=int,
@@ -318,6 +325,14 @@ def main() -> int:
                 continue
             iou3d = _voxel_iou(voxels[ta], voxels[tb], args.voxel_size)
             if iou3d < args.merge_voxel_iou_thresh:
+                continue
+            # Temporal-disjointness gate: two tracks that share many KFs are
+            # different physical entities (a single object can not be in two
+            # places in the same frame). Catches the same-class spatial-overlap
+            # failure mode where two persons walk close together and the high
+            # cos+voxel-IoU would otherwise greedy-merge them.
+            cooccur = len(set(track_kfs[ta]) & set(track_kfs[tb]))
+            if cooccur > args.merge_max_cooccurrence:
                 continue
             _union(ta, tb)
             n_merges += 1
