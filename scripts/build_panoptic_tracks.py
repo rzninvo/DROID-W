@@ -67,26 +67,45 @@ def _bbox_from_mask(mask: np.ndarray) -> List[float]:
     return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
 
 
-def _instance_centroid_world(mask: np.ndarray, depth: np.ndarray, pose_c2w: np.ndarray,
-                             fx: float, fy: float, cx: float, cy: float,
-                             min_depth: float = 0.05, max_depth: float = 10.0) -> np.ndarray:
-    """Median XYZ in world frame of pixels under `mask` (median ≫ mean for noise robustness)."""
+def _instance_world_points(mask: np.ndarray, depth: np.ndarray, pose_c2w: np.ndarray,
+                           fx: float, fy: float, cx: float, cy: float,
+                           min_depth: float = 0.05, max_depth: float = 10.0,
+                           stride: int = 8) -> np.ndarray:
+    """All-pixel world-frame point cloud for `mask`, subsampled at `stride`.
+
+    Returns (M, 3) float32, or empty (0, 3) if no valid depth in mask.
+    Reviewer 1 #3 (paper-blocker): voxel-IoU MUST use the full point cloud
+    per OVI-MAP §3.3, not just per-KF centroid medians (which under-merge).
+    """
     if not mask.any():
-        return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
-    H, W = mask.shape
+        return np.zeros((0, 3), dtype=np.float32)
     ys, xs = np.where(mask)
+    if stride > 1:
+        ys = ys[::stride]
+        xs = xs[::stride]
     z = depth[ys, xs].astype(np.float64)
     valid = (z >= min_depth) & (z <= max_depth) & np.isfinite(z)
     if not valid.any():
-        return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32)
     z = z[valid]
     xs = xs[valid].astype(np.float64)
     ys = ys[valid].astype(np.float64)
     x_cam = (xs - cx) * z / fx
     y_cam = (ys - cy) * z / fy
-    cam = np.stack([x_cam, y_cam, z, np.ones_like(z)], axis=0)            # (4, M)
-    world = pose_c2w @ cam                                                # (4, M)
-    return np.median(world[:3], axis=1).astype(np.float32)
+    cam = np.stack([x_cam, y_cam, z, np.ones_like(z)], axis=0)
+    world = pose_c2w @ cam                                          # (4, M)
+    return world[:3].T.astype(np.float32)                           # (M, 3)
+
+
+def _instance_centroid_world(mask: np.ndarray, depth: np.ndarray, pose_c2w: np.ndarray,
+                             fx: float, fy: float, cx: float, cy: float,
+                             min_depth: float = 0.05, max_depth: float = 10.0) -> np.ndarray:
+    """Median XYZ in world frame of pixels under `mask` (median > mean for noise robustness)."""
+    pts = _instance_world_points(mask, depth, pose_c2w, fx, fy, cx, cy,
+                                 min_depth=min_depth, max_depth=max_depth, stride=1)
+    if pts.shape[0] == 0:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+    return np.median(pts, axis=0)
 
 
 def _voxel_iou(centroids_a: np.ndarray, centroids_b: np.ndarray, voxel_size: float) -> float:
@@ -121,8 +140,16 @@ def main() -> int:
                    help="3D merge: voxel-IoU gate (OVI-MAP §3.3).")
     p.add_argument("--voxel-size", default=0.05, type=float,
                    help="Voxel grid (m). 5 cm matches OVI-MAP / ConceptGraphs.")
-    p.add_argument("--min-track-kf-count", default=1, type=int,
-                   help="Drop tracks seen in fewer than N KFs.")
+    p.add_argument("--min-track-kf-count", default=3, type=int,
+                   help="Drop tracks seen in fewer than N KFs (Reviewer 2 #2: "
+                        "singletons are noise; default 3 cuts ~36%% over-fragmentation).")
+    p.add_argument("--voxel-iou-on-pointcloud", action="store_true", default=True,
+                   help="Reviewer 1 #3 (paper-blocker): voxel-IoU on the FULL "
+                        "subsampled per-instance point cloud (OVI-MAP §3.3 spec), "
+                        "not on per-KF centroid medians (which under-merge).")
+    p.add_argument("--pointcloud-stride", default=8, type=int,
+                   help="Stride when subsampling instance pixels for voxel-IoU "
+                        "(8 → ~50 points / 200-pixel mask; bounded memory).")
     args = p.parse_args()
 
     pan_path = Path(args.panoptic)
@@ -167,9 +194,24 @@ def main() -> int:
     print(f"[stream] N_frames={len(stream)}  K  fx={fx:.2f} cx={cx:.2f}", flush=True)
 
     # ── 2D PRE-PASS: appearance-based MaskTracker per KF ───────────────────
+    # Reviewer 1 + 2 critical: lang_emb_pca norms span 0.57-1.02 (median 0.79)
+    # but MaskTracker uses raw np.dot which equals cos·|a|·|b|, so a true
+    # cosine of 0.85 yields ~0.55 raw — at the threshold and over-fragments
+    # 12x. Fix: L2-normalize before pushing into the detection dict so np.dot
+    # equals true cosine.
+    norms = np.linalg.norm(lang_emb.astype(np.float32), axis=1)
+    print(f"[fix-norm] lang_emb_pca norms before normalize: "
+          f"min={norms.min():.3f} median={np.median(norms):.3f} max={norms.max():.3f}",
+          flush=True)
+    lang_emb_normed = (lang_emb.astype(np.float32)
+                       / np.maximum(norms[:, None], 1e-8)).astype(np.float32)
+
     print(f"\n=== 2D MaskTracker pass (cosine+IoU @ thr={args.track_thresh_2d}) ===", flush=True)
     tracker = MaskTracker(match_thresh=args.track_thresh_2d, max_age=args.track_max_age)
     track_ids_per_inst = np.full(K_total, -1, dtype=np.int64)
+    # Cache per-instance world point cloud (subsampled) for voxel-IoU later.
+    inst_pointclouds: List[np.ndarray] = [None] * K_total
+
     t0 = time.time()
     for kf in range(N_kfs):
         start, end = int(per_kf_offsets[kf]), int(per_kf_offsets[kf + 1])
@@ -177,9 +219,7 @@ def main() -> int:
         for inst in range(start, end):
             m = masks[inst].astype(bool)
             box = _bbox_from_mask(m)
-            emb = np.asarray(lang_emb[inst], dtype=np.float32)
-            # MaskTracker expects clip_emb on instance dict; we pass pca-256
-            # (same cosine semantics, just smaller dim — confirmed on f3+rep).
+            emb = lang_emb_normed[inst]   # already L2-normalized
             detections.append({
                 "mask": m, "box": box, "label": "object", "clip_emb": emb,
             })
@@ -207,6 +247,7 @@ def main() -> int:
     cached_kf: int = -1
     cached_depth: np.ndarray = None
     cached_pose: np.ndarray = None
+    inst_centroid_cache: List[np.ndarray] = [None] * K_total  # for the final-track centroid pass
     t0 = time.time()
     for inst in range(K_total):
         kf_local = int(np.searchsorted(per_kf_offsets[1:], inst, side="right"))
@@ -216,9 +257,14 @@ def main() -> int:
             cached_pose = pose_t.cpu().numpy() if torch.is_tensor(pose_t) else np.asarray(pose_t)
             cached_kf = kf_local
         m = masks[inst].astype(bool)
-        c = _instance_centroid_world(m, cached_depth, cached_pose, fx, fy, cx, cy)
-        if not np.isfinite(c).all():
+        # All-pixel subsampled world point cloud for voxel-IoU (paper-blocker fix).
+        pts = _instance_world_points(m, cached_depth, cached_pose, fx, fy, cx, cy,
+                                     stride=args.pointcloud_stride)
+        if pts.shape[0] == 0:
             continue
+        c = np.median(pts, axis=0)
+        inst_centroid_cache[inst] = c
+        inst_pointclouds[inst] = pts
         tid = int(track_ids_per_inst[inst])
         track_centroids.setdefault(tid, []).append(c)
         track_areas.setdefault(tid, []).append(int(areas[inst]))
@@ -232,6 +278,7 @@ def main() -> int:
           flush=True)
     track_ids_sorted = sorted(track_centroids.keys())
     # Per-track fused embedding (visibility-weighted) for the merge cosine test.
+    # Per-track concatenated point cloud (all instances) for voxel-IoU.
     fused: Dict[int, np.ndarray] = {}
     voxels: Dict[int, np.ndarray] = {}
     for tid in track_ids_sorted:
@@ -242,7 +289,12 @@ def main() -> int:
         e = (embs * weights[:, None]).sum(axis=0) / weights.sum()
         e = e / (np.linalg.norm(e) + 1e-8)
         fused[tid] = e
-        voxels[tid] = np.stack(track_centroids[tid])
+        # Concat ALL per-instance point clouds for this track (Reviewer 1 #3).
+        pcs = []
+        for inst in range(K_total):
+            if int(track_ids_per_inst[inst]) == tid and inst_pointclouds[inst] is not None:
+                pcs.append(inst_pointclouds[inst])
+        voxels[tid] = np.concatenate(pcs, axis=0) if pcs else np.zeros((0, 3), dtype=np.float32)
 
     # Union-find over track IDs.
     parent = {tid: tid for tid in fused}
@@ -332,21 +384,14 @@ def main() -> int:
         # We didn't keep a per-instance centroid; quick re-walk:
         track_n_inst[gid] += 1
 
-    # Re-walk for centroids (needs depth/pose cache again — small cost).
-    cached_kf = -1
+    # Reviewer 2 #4: reuse cached per-instance centroids from the unproject
+    # pass instead of re-streaming. Saves ~40s on Replica room0.
     for inst in range(K_total):
         gid = int(final_global_id[inst])
         if gid < 0:
             continue
-        kf_local = int(np.searchsorted(per_kf_offsets[1:], inst, side="right"))
-        if kf_local != cached_kf:
-            _, _, depth_t, pose_t = stream[kf_local]
-            cached_depth = depth_t.cpu().numpy() if torch.is_tensor(depth_t) else np.asarray(depth_t)
-            cached_pose = pose_t.cpu().numpy() if torch.is_tensor(pose_t) else np.asarray(pose_t)
-            cached_kf = kf_local
-        m = masks[inst].astype(bool)
-        c = _instance_centroid_world(m, cached_depth, cached_pose, fx, fy, cx, cy)
-        if not np.isfinite(c).all():
+        c = inst_centroid_cache[inst]
+        if c is None or not np.isfinite(c).all():
             continue
         track_centroid_final[gid] += c
         centroid_count[gid] += 1
