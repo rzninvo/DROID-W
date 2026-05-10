@@ -399,8 +399,12 @@ def main() -> int:
     for gid in range(G_final):
         if track_total_vis[gid] > 0:
             track_emb_final[gid] /= float(track_total_vis[gid])
-            n = np.linalg.norm(track_emb_final[gid]) + 1e-8
-            track_emb_final[gid] /= n
+            # NOTE: do NOT L2-normalize here. track_emb_final must remain in
+            # PCA-coord space (i.e. = weighted_avg((F_i - mean) @ V.T)) so that
+            # the B.4 decode `e @ V + mean ≈ F_i_avg` reconstructs in the
+            # original SigLIP-2 lang space. Normalizing here would lose the
+            # magnitude information needed for the decode and silently push
+            # cosines on text queries to ~0 (was a real bug, caught at B.4).
         if centroid_count[gid] > 0:
             track_centroid_final[gid] /= float(centroid_count[gid])
 
