@@ -1,0 +1,31 @@
+inherit_from: ./configs/droid_w.yaml
+
+dataset: 'replica'
+scene: room0
+
+data:
+  root_folder: /home/cvg/datasets/Replica/Replica
+  input_folder: /home/cvg/datasets/Replica/Replica/room0
+  output: ./Outputs/Replica
+  stride: 1
+  max_frames: -1
+
+cam:
+  # NICE-SLAM-rendered Replica intrinsics (canonical for the cvg-data.inf.ethz.ch
+  # nice-slam/data/Replica.zip release). H=680, W=1200 native; we keep aspect.
+  # Pose convention: OpenGL c2w (no Y/Z flip), per `Replica.load_poses` in
+  # `src/utils/datasets.py`. Differs from NICE-SLAM by 2 column sign flips —
+  # any downstream eval that compares against NICE-SLAM's mesh-vertex GT MUST
+  # apply the flip itself or convert via the documented adapter. See
+  # Report 18 B.0 for the verification trail.
+  png_depth_scale: 6553.5
+  H: 680
+  W: 1200
+  fx: 600.0
+  fy: 600.0
+  cx: 599.5
+  cy: 339.5
+  H_edge: 0
+  W_edge: 0
+  H_out: 680
+  W_out: 1200

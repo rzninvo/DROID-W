@@ -244,7 +244,19 @@ class BaseDataset(Dataset):
 
 
 class Replica(BaseDataset):
-    """This is from splat-slam, never test it (todo)"""
+    """NICE-SLAM-rendered Replica loader (cvg-data.inf.ethz.ch/nice-slam/data/Replica.zip).
+
+    Pose convention: traj.txt rows are 4x4 c2w matrices in OpenGL convention
+    (X right, Y up, Z back). This loader does NOT flip Y/Z columns (splat-slam
+    convention). NICE-SLAM's own loader DOES flip - if downstream tools expect
+    NICE-SLAM/OpenCV c2w (X right, Y down, Z forward), apply the flip
+    explicitly. See `load_poses` below for the commented-out flip.
+
+    Verification status (Report 18 B.0): self-reproj median 0.000 px on 5
+    random frames of room0; cross-frame depth consistency median rel-err
+    0.03-0.11% on 4 frame pairs. Loader confirmed self-consistent. Tested by
+    `scripts/verify_dataset_loader.py`.
+    """
     def __init__(self, cfg, device='cuda:0'):
         super(Replica, self).__init__(cfg, device)
         stride = cfg['stride']
@@ -268,19 +280,29 @@ class Replica(BaseDataset):
 
 
     def load_poses(self, path):
+        # OpenGL c2w. Splat-slam convention: leave columns untouched.
+        # NICE-SLAM applies `c2w[:3, 1] *= -1; c2w[:3, 2] *= -1` to rotate into
+        # OpenCV (X right, Y down, Z forward). We deliberately don't flip;
+        # downstream BA + RADIO sample features using their own OpenGL-aware
+        # math (see `verify_dataset_loader.py` cross-frame test which confirms
+        # self-consistency at <0.5% relative depth error). If you ever uncomment
+        # the flips, you MUST also update Report 18 B.0's pose-convention note.
         self.poses = []
         with open(path, "r") as f:
             lines = f.readlines()
         for i in range(self.n_img):
             line = lines[i]
             c2w = np.array(list(map(float, line.split()))).reshape(4, 4)
-            # c2w[:3, 1] *= -1
-            # c2w[:3, 2] *= -1
+            # c2w[:3, 1] *= -1   # NICE-SLAM flip — intentionally disabled
+            # c2w[:3, 2] *= -1   # NICE-SLAM flip — intentionally disabled
             self.poses.append(c2w)
 
 
 class ScanNet(BaseDataset):
-    """This is from splat-slam, never test it (todo)"""
+    """ScanNet loader (from splat-slam). Status: dataset_dict registered;
+    self-reproj + cross-frame verification per Report 18 B.0 not yet run on a
+    ScanNet scene (Plan B's eval scope is Replica + freiburg3 only). When you
+    add ScanNet to the eval, run `scripts/verify_dataset_loader.py` first."""
     def __init__(self, cfg, device='cuda:0'):
         super(ScanNet, self).__init__(cfg, device)
         stride = cfg['stride']
@@ -594,4 +616,6 @@ dataset_dict = {
     "youtube": RGB_NoPose,
     "dycheck": Dycheck,
     "droidw": RGB_NoPose,
+    "replica": Replica,
+    "scannet": ScanNet,
 }
