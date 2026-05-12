@@ -228,18 +228,27 @@ def main() -> int:
                 color = color[0]
             return (color * 255.0).clip(0, 255).astype(np.uint8)  # (3, H, W) uint8
 
-    # Probe one keyframe to learn the feature grid + lang-aligned dim.
+    # Probe one keyframe to learn the feature grid + encoder + lang-aligned dim.
     img0_np = _get_image_uint8(0)
     img0 = torch.from_numpy(img0_np).float() / 255.0  # (3, H, W)
     img0 = img0.unsqueeze(0).to(args.device)
     with torch.no_grad():
-        feat0 = encoder.encode_image_to_feat_map(img0)             # (1, C_radio, h, w)
+        feat0 = encoder.encode_image_to_feat_map(img0)             # (1, C_enc, h, w)
         aligned0 = encoder.align_spatial_features_with_language(feat0, onehot=False)
-    _, D, hp, wp = aligned0.shape
-    print(f"[setup] feat grid (h,w)=({hp},{wp})  lang-aligned dim D={D}", flush=True)
+    _, C_enc, hp, wp = feat0.shape
+    _, D_aligned, _, _ = aligned0.shape
+    print(f"[setup] feat grid (h,w)=({hp},{wp})  encoder dim C_enc={C_enc}  "
+          f"lang-aligned dim D={D_aligned}", flush=True)
+    # Plan-v2 Option B (encoder-space): per RADIO-ViPE Sec III-B, BA-side use
+    # needs the RAW encoder feature map (preserves DINOv2 / SAM teachers'
+    # spatial-fidelity content), NOT the post-SigLIP-2 language-aligned head
+    # (which projects to language space and discards geometric structure).
+    # We save both so downstream consumers can pick:
+    #   encoder_feats     -- for BA / D.1 / D.2 (and PCA in encoder space)
+    #   lang_aligned_feats -- for open-vocab text query (Step 1 / Plan B v5)
 
-    # Allocate output buffer on CPU. fp16 is enough for cosine quality.
-    feats_cpu = np.zeros((N, D, hp, wp), dtype=np.float16)
+    feats_cpu = np.zeros((N, D_aligned, hp, wp), dtype=np.float16)      # lang-aligned
+    enc_cpu = np.zeros((N, C_enc, hp, wp), dtype=np.float16)            # raw encoder
 
     t_loop = time.time()
     for i in range(N):
@@ -247,8 +256,9 @@ def main() -> int:
         img = torch.from_numpy(img_np).float() / 255.0
         img = img.unsqueeze(0).to(args.device)
         with torch.no_grad():
-            f = encoder.encode_image_to_feat_map(img)              # (1, C_radio, h, w)
+            f = encoder.encode_image_to_feat_map(img)              # (1, C_enc, h, w)
             a = encoder.align_spatial_features_with_language(f, onehot=False)
+        enc_cpu[i]  = f.squeeze(0).cpu().to(torch.float16).numpy()
         feats_cpu[i] = a.squeeze(0).cpu().to(torch.float16).numpy()
         del img, f, a
         if (i + 1) % 10 == 0 or i == 0 or i == N - 1:
@@ -288,7 +298,13 @@ def main() -> int:
 
     np.savez(
         out_path,
-        lang_aligned_feats=feats_cpu,             # (N, D, hp, wp) fp16
+        lang_aligned_feats=feats_cpu,             # (N, D_aligned, hp, wp) fp16
+        encoder_feats=enc_cpu,                    # (N, C_enc, hp, wp) fp16
+                                                  # raw RADIO backbone output
+                                                  # (RADIO-ViPE Sec III-B BA-side
+                                                  # feature; preserves DINOv2/SAM
+                                                  # teachers' spatial fidelity).
+        encoder_dim=np.int64(C_enc),
         radio_version=np.array(args.radio_version),
         lang_adaptor=np.array(lang_adaptor),
         scra_scaling=np.float32(args.scra_scaling),
@@ -296,7 +312,7 @@ def main() -> int:
         slide_crop=np.int64(args.slide_crop),
         slide_stride=np.int64(args.slide_stride),
         prompt_denoising_thresh_default=np.float32(args.prompt_denoising_thresh_default),
-        feature_dim=np.int64(D),
+        feature_dim=np.int64(D_aligned),
         n_keyframes=np.int64(N),
         n_keyframes_in_video=np.int64(N_full),
         image_hw=np.asarray([H, W], dtype=np.int64),

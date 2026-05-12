@@ -219,13 +219,28 @@ class SLAM:
             self.video.semantic_weight_aware = False
             return
         feats_npz = np.load(str(npz_path))
-        for field in ('lang_aligned_feats', 'kf_indices'):
+        # ── Plan-v2 §Step 3a Option B: select the feature head. Default to
+        # 'encoder_feats' (raw RADIO backbone -- preserves DINOv2 + SAM teacher
+        # spatial fidelity per RADIO-ViPE Sec III-B). Allow opting back to
+        # 'lang_aligned_feats' for the legacy comparator runs. v1 npzs only
+        # have lang_aligned_feats; v2 has both. ──
+        features_key = str(sw_cfg.get('features_key', 'encoder_feats'))
+        if features_key not in ('encoder_feats', 'lang_aligned_feats'):
+            print(f"[WARN] semantic_weight: features_key={features_key!r} "
+                  f"not in {{encoder_feats, lang_aligned_feats}} — disabling D.2.",
+                  flush=True)
+            self.video.semantic_weight_aware = False
+            return
+        for field in (features_key, 'kf_indices'):
             if field not in feats_npz.files:
                 print(f"[WARN] semantic_weight: {npz_path} missing '{field}' "
-                      f"(found {feats_npz.files}) — disabling D.2.", flush=True)
+                      f"(found {feats_npz.files}) — disabling D.2. Hint: "
+                      f"v1 npzs only have lang_aligned_feats; re-precompute "
+                      f"with the schema-v2 precompute_radseg_features.py to "
+                      f"get encoder_feats.", flush=True)
                 self.video.semantic_weight_aware = False
                 return
-        feats = feats_npz['lang_aligned_feats']
+        feats = feats_npz[features_key]
         # ── Plan-v2 §Step 3a Option A: use kf_global_indices (dataset frame
         # index per row), NOT kf_indices (local KF position [0..N-1]). The
         # old (schema v1) consumer path looked up frame_idx in a dict keyed by
@@ -296,8 +311,9 @@ class SLAM:
                   f"var_explained={state.get('fit_variance_explained', 'n/a')}).",
                   flush=True)
         print(f"[INFO] semantic_weight: loaded radseg_features from {npz_path}; "
-              f"{feats.shape} dtype={feats.dtype}, radio={radio_version}, "
-              f"adaptor={lang_adaptor}, schema_version={schema_version}, "
+              f"features_key={features_key} shape={feats.shape} dtype={feats.dtype}, "
+              f"radio={radio_version}, adaptor={lang_adaptor}, "
+              f"schema_version={schema_version}, "
               f"N_kf_precomp={len(kf_global_indices)}.", flush=True)
         # First few mappings — would have caught the v1 bug immediately.
         head = kf_global_indices[:5].tolist()

@@ -68,7 +68,8 @@ DEFAULT_SOURCES = [
 ]
 
 
-def _sample_features(sources: list[tuple[str, Path]], n_per_source: int, seed: int) -> tuple[np.ndarray, dict]:
+def _sample_features(sources: list[tuple[str, Path]], n_per_source: int, seed: int,
+                     features_key: str = "lang_aligned_feats") -> tuple[np.ndarray, dict]:
     """Pool random feature vectors across the given sources.
 
     Returns:
@@ -77,7 +78,7 @@ def _sample_features(sources: list[tuple[str, Path]], n_per_source: int, seed: i
     """
     rng = np.random.default_rng(seed)
     X_chunks = []
-    meta = {"sources": [], "D": None}
+    meta = {"sources": [], "D": None, "features_key": features_key}
     for label, path in sources:
         if not Path(path).exists():
             # Reviewer A audit fix #2: silent skip on missing source could
@@ -89,7 +90,14 @@ def _sample_features(sources: list[tuple[str, Path]], n_per_source: int, seed: i
                 f"features first."
             )
         m = np.load(path)
-        feats = m["lang_aligned_feats"]   # (N, D, h, w) fp16
+        if features_key not in m.files:
+            raise SystemExit(
+                f"[FAIL] B.0.5: source '{label}' at {path} lacks "
+                f"'{features_key}' field. Available: {list(m.files)}. "
+                f"Re-precompute with the updated precompute_radseg_features.py "
+                f"(saves both lang_aligned_feats and encoder_feats)."
+            )
+        feats = m[features_key]            # (N, D, h, w) fp16
         N, D, h, w = feats.shape
         if meta["D"] is None:
             meta["D"] = int(D)
@@ -151,6 +159,13 @@ def main() -> int:
     p.add_argument("--out", default="weights/pca_basis.pt", type=str)
     p.add_argument("--sources", default=None, nargs="+",
                    help="Override default sources (label=path label2=path2 ...).")
+    p.add_argument("--features-key", default="lang_aligned_feats",
+                   choices=["lang_aligned_feats", "encoder_feats"],
+                   help="Which feature head to PCA. 'lang_aligned_feats' for "
+                        "the open-vocab text query path (Plan B v5); "
+                        "'encoder_feats' for the BA-side path per RADIO-ViPE "
+                        "Sec III-B (preserves geometric content from DINOv2 + "
+                        "SAM teachers).")
     args = p.parse_args()
 
     out_path = REPO_ROOT / args.out
@@ -173,7 +188,8 @@ def main() -> int:
     for label, path in sources:
         print(f"  {label:30s}  {path}  exists={Path(path).exists()}", flush=True)
 
-    X, meta = _sample_features(sources, args.n_per_source, args.seed)
+    X, meta = _sample_features(sources, args.n_per_source, args.seed,
+                               features_key=args.features_key)
     mean, components, expl = _fit_pca(X, args.target_dim)
     print(f"[fit] components shape={components.shape}  variance_explained_top{args.target_dim}={expl*100:.2f}%",
           flush=True)

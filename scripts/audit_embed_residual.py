@@ -193,6 +193,10 @@ def main() -> int:
     p.add_argument("--out", required=True, type=Path,
                    help=".npz dump of per-edge arrays")
     p.add_argument("--gate-rho", default=0.2, type=float)
+    p.add_argument("--features-key", default="lang_aligned_feats",
+                   choices=["lang_aligned_feats", "encoder_feats"],
+                   help="Which feature head to audit. 'encoder_feats' per "
+                        "RADIO-ViPE Sec III-B preserves geometric content.")
     args = p.parse_args()
 
     scene = args.scene
@@ -245,12 +249,30 @@ def main() -> int:
     gt_xyz_kf = gt_xyz[kf_to_gt]                                       # (N_kf, 3)
     err_per_kf_m = np.linalg.norm(est_xyz_kf - gt_xyz_kf, axis=1)      # (N_kf,) in meters
     err_per_kf_mm = err_per_kf_m * 1000.0
-    print(f"[step3a] per-KF position error: median={np.median(err_per_kf_mm):.2f} mm, "
+    print(f"[step3a] per-KF Sim3-aligned position error: median={np.median(err_per_kf_mm):.2f} mm, "
           f"max={err_per_kf_mm.max():.2f} mm", flush=True)
+
+    # ── 4b. Per-KF est + gt 7-vec for per-edge RPE proxy ──
+    # Plan-v2 review (user): per-edge Relative Pose Error is a stronger,
+    # more LOCAL proxy than the per-KF Sim3-aligned absolute error.
+    # For edge (i,j): RPE_ij = || trans(T_ij_est) - trans(T_ij_gt) || where
+    # T_ij = T_j @ inv(T_i) is the i->j camera transform (independent of
+    # any global SLAM-to-GT alignment except scale).
+    est_arr_q = est_arr[:, 1:8]                                        # (N_frames, 7) c2w TUM
+    est_q_kf  = est_arr_q[kf_to_gt]                                    # (N_kf, 7)
+    gt_q_kf   = gt_q[kf_to_gt]                                         # (N_kf, 7) tx ty tz qx qy qz qw
+    est_T_kf = np.stack([_qtvec_to_T(est_q_kf[i]) for i in range(N_kf)], axis=0)
+    gt_T_kf  = np.stack([_qtvec_to_T(gt_q_kf[i])  for i in range(N_kf)], axis=0)
 
     # ── 5. Load radseg features, resample to BA grid, optional PCA, L2-norm
     feats_npz = np.load(feats_path, allow_pickle=False)
-    feats_native = torch.from_numpy(feats_npz["lang_aligned_feats"]).float()    # (N_p, D, h_n, w_n)
+    features_key = getattr(args, "features_key", "lang_aligned_feats")
+    if features_key not in feats_npz.files:
+        print(f"[ERR] {feats_path} lacks '{features_key}'. Available: "
+              f"{list(feats_npz.files)}", flush=True)
+        return 2
+    feats_native = torch.from_numpy(feats_npz[features_key]).float()    # (N_p, D, h_n, w_n)
+    print(f"[step3a] features_key={features_key}", flush=True)
     N_p, D_raw, h_n, w_n = feats_native.shape
     print(f"[step3a] radseg: N_precomp={N_p}, D_raw={D_raw}, native=({h_n},{w_n})", flush=True)
 
@@ -296,6 +318,7 @@ def main() -> int:
     e_emb_list = []
     e_ate_list = []
     e_valid_frac_list = []
+    e_rpe_list = []
     poses_T = [_qtvec_to_T(poses_qt[k]) for k in range(N_kf)]
     # DROID-W stores tum_poses in c2w (TUM convention); to get T_w2c for projection use inv.
     poses_w2c = [np.linalg.inv(T) for T in poses_T]
@@ -336,14 +359,25 @@ def main() -> int:
             mean_r2 = float((r_sem2 * valid_f).sum() / valid_f.sum())
             ate_proxy = float(max(err_per_kf_mm[i], err_per_kf_mm[j]))
 
+            # Per-edge RPE proxy (Plan-v2 review): T_ij relative transform
+            # consistency between est and gt. Scale the est by the global
+            # Sim3 scale factor so translations are commensurate.
+            T_ij_est = np.linalg.inv(est_T_kf[j]) @ est_T_kf[i]         # cam_i -> cam_j (est)
+            T_ij_gt  = np.linalg.inv(gt_T_kf[j])  @ gt_T_kf[i]          # cam_i -> cam_j (gt)
+            t_est = T_ij_est[:3, 3] * scale                            # apply Sim3 scale
+            t_gt  = T_ij_gt[:3, 3]
+            rpe_trans_mm = float(np.linalg.norm(t_est - t_gt) * 1000.0)
+
             edges.append((i, j))
             e_emb_list.append(mean_r2)
             e_ate_list.append(ate_proxy)
+            e_rpe_list.append(rpe_trans_mm)
             e_valid_frac_list.append(float(valid_f.mean()))
 
     e_emb = np.asarray(e_emb_list, dtype=np.float64)
     e_ate = np.asarray(e_ate_list, dtype=np.float64)
     e_valid = np.asarray(e_valid_frac_list, dtype=np.float64)
+    e_rpe = np.asarray(e_rpe_list, dtype=np.float64) if e_rpe_list else None
 
     if len(e_emb) < 10:
         print(f"[ERR] only {len(e_emb)} valid edges -- not enough", flush=True)
@@ -356,23 +390,40 @@ def main() -> int:
           flush=True)
     print(f"[step3a] mean r_embed^2: median={np.median(e_emb):.5f}  IQR=({np.percentile(e_emb,25):.5f},{np.percentile(e_emb,75):.5f})",
           flush=True)
-    print(f"[step3a] ATE proxy [mm]: median={np.median(e_ate):.2f}  IQR=({np.percentile(e_ate,25):.2f},{np.percentile(e_ate,75):.2f})",
+    print(f"[step3a] ATE proxy (Sim3-abs) [mm]: median={np.median(e_ate):.2f}  IQR=({np.percentile(e_ate,25):.2f},{np.percentile(e_ate,75):.2f})",
           flush=True)
-    print(f"[step3a] Spearman rho={rho:.4f}  (p-value={p:.2e})" if p is not None
-          else f"[step3a] Spearman rho={rho:.4f}", flush=True)
-    print(f"[step3a] Pearson r   ={pearson:.4f}", flush=True)
-    print(f"[step3a] gate: rho >= {args.gate_rho}", flush=True)
-    passed = rho >= args.gate_rho
+    print(f"[step3a] Spearman rho vs ATE-abs ={rho:+.4f}  (p={p:.2e})" if p is not None
+          else f"[step3a] Spearman rho vs ATE-abs ={rho:+.4f}", flush=True)
+    print(f"[step3a] Pearson r vs ATE-abs    ={pearson:+.4f}", flush=True)
+
+    # Per-edge RPE proxy (Plan-v2 review): more local than the absolute
+    # Sim3-aligned ATE -- compares the relative transform i->j in est vs gt.
+    if e_rpe is not None and len(e_rpe) == len(e_emb):
+        rho_rpe, p_rpe = _spearman(e_emb, e_rpe)
+        pearson_rpe = float(np.corrcoef(e_emb, e_rpe)[0, 1])
+        print(f"[step3a] RPE proxy (per-edge trans) [mm]: median={np.median(e_rpe):.2f}  "
+              f"IQR=({np.percentile(e_rpe,25):.2f},{np.percentile(e_rpe,75):.2f})",
+              flush=True)
+        print(f"[step3a] Spearman rho vs RPE     ={rho_rpe:+.4f}  (p={p_rpe:.2e})",
+              flush=True)
+        print(f"[step3a] Pearson r vs RPE        ={pearson_rpe:+.4f}", flush=True)
+    else:
+        rho_rpe = float("nan"); pearson_rpe = float("nan")
+    print(f"[step3a] gate: rho >= {args.gate_rho} (against either proxy)", flush=True)
+    passed = rho >= args.gate_rho or (e_rpe is not None and rho_rpe >= args.gate_rho)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.out,
              edges=np.asarray(edges),
              mean_r_embed2=e_emb,
              ate_proxy_mm=e_ate,
+             rpe_proxy_mm=e_rpe if e_rpe is not None else np.zeros(0),
              valid_frac=e_valid,
              spearman_rho=rho,
              spearman_p=p if p is not None else float("nan"),
+             spearman_rho_rpe=rho_rpe,
              pearson_r=pearson,
+             pearson_r_rpe=pearson_rpe,
              window=args.window,
              gate_rho=args.gate_rho,
              passed=passed)

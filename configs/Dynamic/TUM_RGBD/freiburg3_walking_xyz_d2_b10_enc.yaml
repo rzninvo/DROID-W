@@ -1,0 +1,15 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_xyz.yaml
+scene: freiburg3_walking_xyz_d2_b10_enc
+
+# Plan-v2 §Step 3a Option B: D.2 with RAW RADIO encoder features on walking_xyz.
+# Companion to walking_static_d2_b10_enc; tests whether the +0.782 mm regression
+# under lang-aligned features (Option A, Report 22) was specific to the wrong
+# feature head.
+tracking:
+  semantic_weight:
+    activate: True
+    beta: 10.0
+    w_min: 0.1
+    features_key: encoder_feats
+    pca_basis: weights/pca_basis_encoder.pt
+    K: 256

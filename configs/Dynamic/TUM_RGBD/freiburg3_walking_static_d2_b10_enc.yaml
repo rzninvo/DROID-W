@@ -1,0 +1,13 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
+scene: freiburg3_walking_static_d2_b10_enc
+
+# Plan-v2 §Step 3a Option B: D.2 with RAW RADIO encoder features (not the
+# post-SigLIP-2 lang-aligned head), per RADIO-ViPE Sec III-B. seed=43 (default).
+tracking:
+  semantic_weight:
+    activate: True
+    beta: 10.0
+    w_min: 0.1
+    features_key: encoder_feats
+    pca_basis: weights/pca_basis_encoder.pt
+    K: 256
