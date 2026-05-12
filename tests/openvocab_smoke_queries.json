@@ -1,0 +1,26 @@
+{
+  "scene": "TUM_RGBD/freiburg3_walking_static",
+  "rationale": "Plan-v2 Step 1 quantitative gate. Present queries are visible in the scene (two seated people, monitors, chairs, desk, keyboards); absent queries are unambiguously not in an office scene. Used as a regression check for the v5 panoptic pipeline before changing anything in BA (Steps 2 / 3).",
+  "present": ["chair", "monitor", "keyboard", "person", "desk"],
+  "absent": ["fire extinguisher", "elephant", "car"],
+  "gates": {
+    "hit_rate_present": {
+      "operationalised_as": "top-1 raw cosine >= cos_floor (default 0.04 in scripts/query_panoptic.py)",
+      "min_pass": 4,
+      "of_total": 5
+    },
+    "fp_rate_absent": {
+      "operationalised_as": "top-1 raw cosine <  cos_floor (i.e. no track passes the floor)",
+      "min_pass": 3,
+      "of_total": 3
+    }
+  },
+  "encoder": {
+    "radio_version": "c-radio_v3-b",
+    "lang_adaptor": "siglip2",
+    "pca_basis": "weights/pca_basis.pt",
+    "softmax_temp": 100.0,
+    "cos_floor": 0.04
+  },
+  "note": "Re-tune cos_floor at Step 4 (v7) when switching to siglip-large-patch16-384; this gate is for the v5 baseline."
+}
