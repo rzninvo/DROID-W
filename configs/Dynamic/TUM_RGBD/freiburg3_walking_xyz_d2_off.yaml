@@ -1,0 +1,4 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_xyz.yaml
+scene: freiburg3_walking_xyz_d2_off
+
+# walking_xyz vanilla baseline (D.2 disabled via inherited default).

@@ -1,0 +1,8 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_xyz.yaml
+scene: freiburg3_walking_xyz_d2_b10
+
+# walking_xyz with D.2 enabled at the Step 2 sweep winner (beta=10, w_min=0.1).
+tracking:
+  semantic_weight:
+    activate: True
+    beta: 10.0

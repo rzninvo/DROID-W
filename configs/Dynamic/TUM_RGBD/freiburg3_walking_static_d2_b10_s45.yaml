@@ -1,0 +1,3 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static_d2_b10.yaml
+scene: freiburg3_walking_static_d2_b10_s45
+setup_seed: 45
