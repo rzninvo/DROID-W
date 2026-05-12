@@ -1,0 +1,8 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
+scene: freiburg3_walking_static_d2_off
+
+# Plan-v2 Step 2 disabled-mode regression: confirms the D.2 implementation
+# (depth_video.py + slam.py + droid_w.yaml diffs) is bit-identical to vanilla
+# DROID-W when activate=False. semantic_weight block is left at its default
+# (activate=False from droid_w.yaml) — only the scene name is overridden so
+# the output lands in a fresh dir without clobbering the v5 panoptic artefacts.

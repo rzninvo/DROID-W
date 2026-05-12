@@ -1,0 +1,8 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
+scene: freiburg3_walking_static_d2_b2
+
+# Plan-v2 Step 2 sweep point: beta=2.0 (gentler down-weighting).
+tracking:
+  semantic_weight:
+    activate: True
+    beta: 2.0

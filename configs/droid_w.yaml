@@ -153,9 +153,13 @@ tracking:
   semantic_weight:
     activate: False                  # default off (backwards-compat)
     path: radseg_features.npz        # relative to data.input_folder, fallback save_dir
+    pca_basis: weights/pca_basis.pt  # PCA-256 compression of the 1536-d features
+                                     # (~6x buffer memory reduction; matches v5 Plan B
+                                     # paradigm). Set to null to store raw D_raw-d.
     beta: 5.0                        # exponent steepness; sweep {2, 5, 10}
     w_min: 0.1                       # clamp floor; sweep {0.05, 0.1}; >=1 disables
-    K: 1536                          # feature dim (c-radio_v3-b + siglip2 -> 1536)
+    K: 256                           # feature dim (matches pca_basis target_dim,
+                                     # or D_raw if pca_basis is null)
 
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points

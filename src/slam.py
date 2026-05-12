@@ -229,11 +229,38 @@ class SLAM:
         kf_indices = feats_npz['kf_indices']
         radio_version = str(feats_npz.get('radio_version', np.array('unknown')))
         lang_adaptor = str(feats_npz.get('lang_adaptor', np.array('unknown')))
+        # PCA-256 compression cuts the per-KF buffer by 6x (1536 -> 256 dims).
+        # When pca_basis is set in cfg, load it and pass to preload; otherwise
+        # store raw and pay the memory bill (K must equal D_raw).
+        pca_basis_rel = sw_cfg.get('pca_basis', None)
+        pca_mean = None
+        pca_components = None
+        if pca_basis_rel:
+            from pathlib import Path as _Path
+            import torch as _torch
+            pca_path = _Path(pca_basis_rel)
+            if not pca_path.is_absolute():
+                # Repo-root-relative (matches scripts/query_panoptic.py convention).
+                pca_path = _Path(__file__).resolve().parents[1] / pca_basis_rel
+            if not pca_path.exists():
+                print(f"[WARN] semantic_weight: pca_basis={pca_basis_rel} not "
+                      f"found at {pca_path} — disabling D.2.", flush=True)
+                self.video.semantic_weight_aware = False
+                return
+            state = _torch.load(str(pca_path), map_location='cpu', weights_only=False)
+            pca_mean = state['mean']
+            pca_components = state['components']
+            print(f"[INFO] semantic_weight: loaded pca_basis from {pca_path} "
+                  f"(D={state['feature_dim']} -> K={state['target_dim']}, "
+                  f"var_explained={state.get('fit_variance_explained', 'n/a')}).",
+                  flush=True)
         print(f"[INFO] semantic_weight: loaded radseg_features from {npz_path}; "
               f"{feats.shape} dtype={feats.dtype}, radio={radio_version}, "
               f"adaptor={lang_adaptor}, N_kf_precomp={len(kf_indices)}.",
               flush=True)
-        self.video.preload_radseg_features(kf_indices, feats)
+        self.video.preload_radseg_features(kf_indices, feats,
+                                           pca_mean=pca_mean,
+                                           pca_components=pca_components)
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]

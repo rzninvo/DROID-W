@@ -205,19 +205,27 @@ class DepthVideo:
             f"but dynamic_masks on {self.dynamic_masks.device}"
         )
 
-    def preload_radseg_features(self, kf_indices, lang_aligned_feats):
-        """Resample precomputed RADIO+SigLIP-2 features to the BA grid and
-        L2-normalise. Called once at SLAM start (slam.py) before tracker fork.
+    def preload_radseg_features(self, kf_indices, lang_aligned_feats,
+                                pca_mean=None, pca_components=None):
+        """Resample precomputed RADIO+SigLIP-2 features to the BA grid,
+        optionally PCA-project to target_dim, then L2-normalise. Called
+        once at SLAM start (slam.py) before tracker fork.
 
         Args:
-            kf_indices: (N_precomp,) int — dataset frame idx for each
-                precomputed KF row.
-            lang_aligned_feats: (N_precomp, D, h_native, w_native) numpy
+            kf_indices: (N_precomp,) int — dataset frame idx for each row.
+            lang_aligned_feats: (N_precomp, D_raw, h_native, w_native) numpy
                 from radseg_features.npz.
+            pca_mean: (D_raw,) optional torch/numpy — PCA mean vector.
+            pca_components: (K, D_raw) optional torch/numpy — PCA components
+                matrix (already L2-row-orthogonal). When provided together
+                with pca_mean, features are projected to K dims BEFORE
+                L2-normalisation and storage. This matches the v5 Plan B
+                memory paradigm (PCA-256 lookup) and cuts the per-KF buffer
+                memory by D_raw / K (typically 6x at 1536 -> 256).
 
         Sets:
             self._radseg_kf_idx_dict: {frame_idx: row_idx}
-            self._radseg_feats_ba_t: (N_precomp, D, h_ba, w_ba) fp16 GPU,
+            self._radseg_feats_ba_t: (N_precomp, K, h_ba, w_ba) fp16 GPU,
                 L2-normalised per pixel, share_memory_()'d for spawn-safe IPC.
         """
         if not self.semantic_weight_aware:
@@ -230,29 +238,69 @@ class DepthVideo:
             self.semantic_weight_aware = False
             self.radseg_feats_resize = None
             return
-        N_p, D, h_native, w_native = feats.shape
-        if D != self.semantic_weight_K:
-            print(f"[WARN] semantic_weight: feature dim D={D} != configured "
-                  f"K={self.semantic_weight_K} — disabling D.2.", flush=True)
-            self.semantic_weight_aware = False
-            self.radseg_feats_resize = None
-            return
+        N_p, D_raw, h_native, w_native = feats.shape
+        use_pca = pca_mean is not None and pca_components is not None
+        if use_pca:
+            mean_t = torch.as_tensor(pca_mean, dtype=torch.float32, device=self.device)
+            comps_t = torch.as_tensor(pca_components, dtype=torch.float32, device=self.device)
+            if mean_t.shape[-1] != D_raw:
+                print(f"[WARN] semantic_weight: PCA mean dim {mean_t.shape[-1]} "
+                      f"!= feature D_raw={D_raw} — disabling D.2.", flush=True)
+                self.semantic_weight_aware = False
+                self.radseg_feats_resize = None
+                return
+            if comps_t.shape[-1] != D_raw:
+                print(f"[WARN] semantic_weight: PCA components last dim "
+                      f"{comps_t.shape[-1]} != D_raw={D_raw} — disabling D.2.",
+                      flush=True)
+                self.semantic_weight_aware = False
+                self.radseg_feats_resize = None
+                return
+            K_pca = comps_t.shape[0]
+            if K_pca != self.semantic_weight_K:
+                print(f"[WARN] semantic_weight: PCA target_dim={K_pca} != "
+                      f"configured K={self.semantic_weight_K} — disabling D.2.",
+                      flush=True)
+                self.semantic_weight_aware = False
+                self.radseg_feats_resize = None
+                return
+        else:
+            if D_raw != self.semantic_weight_K:
+                print(f"[WARN] semantic_weight: raw feature dim D={D_raw} != "
+                      f"configured K={self.semantic_weight_K} (no PCA basis "
+                      f"provided) — disabling D.2.", flush=True)
+                self.semantic_weight_aware = False
+                self.radseg_feats_resize = None
+                return
+            mean_t = None
+            comps_t = None
         h_ba = self.ht // self.down_scale
         w_ba = self.wd // self.down_scale
-        # Resample + L2-normalise once at preload (fp32 math, fp16 storage).
-        t = torch.from_numpy(feats).to(self.device).float()
-        t_ba = F.interpolate(t, size=(h_ba, w_ba), mode='bilinear', align_corners=False)
+        # Resample at native dim, then PCA-project (if configured), then
+        # L2-normalise. PCA in fp32 for stability; final storage is fp16.
+        t = torch.from_numpy(feats).to(self.device).float()              # (N, D_raw, h_n, w_n)
+        t_ba = F.interpolate(t, size=(h_ba, w_ba), mode='bilinear',
+                             align_corners=False)                        # (N, D_raw, h_ba, w_ba)
+        del t
+        if use_pca:
+            # Project to K=PCA-target. Reshape (N, D, h, w) -> (N*h*w, D), project, reshape back.
+            N, D_raw_, h_, w_ = t_ba.shape
+            flat = t_ba.permute(0, 2, 3, 1).reshape(-1, D_raw_)          # (N*h*w, D_raw)
+            flat = (flat - mean_t) @ comps_t.T                           # (N*h*w, K)
+            t_ba = flat.reshape(N, h_, w_, -1).permute(0, 3, 1, 2).contiguous()  # (N, K, h, w)
         t_ba = t_ba / (t_ba.norm(dim=1, keepdim=True) + 1e-8)
         self._radseg_feats_ba_t = t_ba.half().contiguous().share_memory_()
-        self._radseg_kf_idx_dict = {int(t): r for r, t in enumerate(kf_idx_arr.tolist())}
-        del t, t_ba
+        self._radseg_kf_idx_dict = {int(v): r for r, v in enumerate(kf_idx_arr.tolist())}
+        K_out = self._radseg_feats_ba_t.shape[1]
+        del t_ba
+        if use_pca:
+            del mean_t, comps_t
         torch.cuda.empty_cache()
-        print(f"[INFO] semantic_weight: loaded N={N_p} radseg KFs ({D}-d, "
-              f"native ({h_native},{w_native}) -> BA ({h_ba},{w_ba})) "
+        print(f"[INFO] semantic_weight: loaded N={N_p} radseg KFs, "
+              f"D_raw={D_raw} -> K={K_out} (PCA={'on' if use_pca else 'off'}), "
+              f"native ({h_native},{w_native}) -> BA ({h_ba},{w_ba}), "
               f"beta={self.semantic_weight_beta}, w_min={self.semantic_weight_min}.",
               flush=True)
-        # Same device as the per-slot buffer; otherwise __item_setter would
-        # cross-device-copy silently. Assert loud per CLAUDE.md §6.
         assert self._radseg_feats_ba_t.device == self.radseg_feats_resize.device, (
             f"semantic_weight: device mismatch — precomp on "
             f"{self._radseg_feats_ba_t.device} but buffer on "

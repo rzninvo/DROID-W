@@ -1,0 +1,9 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
+scene: freiburg3_walking_static_d2_b10
+
+# Plan-v2 Step 2 sweep point: beta=10.0 (aggressive down-weighting; should
+# saturate to w_sem ~= w_min for any low-similarity pixel).
+tracking:
+  semantic_weight:
+    activate: True
+    beta: 10.0

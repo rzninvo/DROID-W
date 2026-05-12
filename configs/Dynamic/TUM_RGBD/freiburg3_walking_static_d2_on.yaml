@@ -1,0 +1,12 @@
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_static.yaml
+scene: freiburg3_walking_static_d2_on
+
+# Plan-v2 Step 2 enabled-mode run with defaults beta=5.0, w_min=0.1.
+# Loads radseg_features.npz from the v5 Outputs dir for this scene
+# (resolved via slam.py's save_dir fallback).
+tracking:
+  semantic_weight:
+    activate: True
+    # All other fields inherit from droid_w.yaml: pca_basis=weights/pca_basis.pt,
+    # K=256 (PCA-256 matches v4-h+siglip2-g basis target_dim), beta=5.0,
+    # w_min=0.1, path=radseg_features.npz.
