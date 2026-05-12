@@ -205,14 +205,18 @@ class DepthVideo:
             f"but dynamic_masks on {self.dynamic_masks.device}"
         )
 
-    def preload_radseg_features(self, kf_indices, lang_aligned_feats,
+    def preload_radseg_features(self, kf_global_indices, lang_aligned_feats,
                                 pca_mean=None, pca_components=None):
         """Resample precomputed RADIO+SigLIP-2 features to the BA grid,
         optionally PCA-project to target_dim, then L2-normalise. Called
         once at SLAM start (slam.py) before tracker fork.
 
         Args:
-            kf_indices: (N_precomp,) int — dataset frame idx for each row.
+            kf_global_indices: (N_precomp,) int — DATASET FRAME INDEX for each
+                precomputed row. Plan-v2 §Step 3a Option A: this MUST be the
+                true frame index (e.g. [0, 9, 14, ...] for stride-9 TUM), not
+                the local KF position [0..N-1]. slam.py is responsible for
+                reading it from `kf_global_indices` in the v2 npz schema.
             lang_aligned_feats: (N_precomp, D_raw, h_native, w_native) numpy
                 from radseg_features.npz.
             pca_mean: (D_raw,) optional torch/numpy — PCA mean vector.
@@ -224,13 +228,30 @@ class DepthVideo:
                 memory by D_raw / K (typically 6x at 1536 -> 256).
 
         Sets:
-            self._radseg_kf_idx_dict: {frame_idx: row_idx}
+            self._radseg_kf_idx_dict: {frame_idx: row_idx}  (frame_idx is the
+                dataset frame index, MATCHING tstamps passed at __item_setter)
             self._radseg_feats_ba_t: (N_precomp, K, h_ba, w_ba) fp16 GPU,
                 L2-normalised per pixel, share_memory_()'d for spawn-safe IPC.
         """
         if not self.semantic_weight_aware:
             return
-        kf_idx_arr = np.asarray(kf_indices, dtype=np.int64)
+        kf_idx_arr = np.asarray(kf_global_indices, dtype=np.int64)
+        # Plan-v2 §Step 3a Option A: validate the index contract loudly.
+        # Length and uniqueness mirror the precompute's save-time checks.
+        if len(np.unique(kf_idx_arr)) != len(kf_idx_arr):
+            print(f"[WARN] semantic_weight: kf_global_indices has "
+                  f"{len(kf_idx_arr) - len(np.unique(kf_idx_arr))} duplicates; "
+                  f"feature lookup ambiguous -- disabling D.2.", flush=True)
+            self.semantic_weight_aware = False
+            self.radseg_feats_resize = None
+            return
+        if (kf_idx_arr < 0).any():
+            print(f"[WARN] semantic_weight: kf_global_indices has negative "
+                  f"values (min={kf_idx_arr.min()}) -- disabling D.2.",
+                  flush=True)
+            self.semantic_weight_aware = False
+            self.radseg_feats_resize = None
+            return
         feats = np.asarray(lang_aligned_feats)
         if feats.ndim != 4:
             print(f"[WARN] semantic_weight: lang_aligned_feats shape {feats.shape} "
@@ -290,8 +311,13 @@ class DepthVideo:
             t_ba = flat.reshape(N, h_, w_, -1).permute(0, 3, 1, 2).contiguous()  # (N, K, h, w)
         t_ba = t_ba / (t_ba.norm(dim=1, keepdim=True) + 1e-8)
         self._radseg_feats_ba_t = t_ba.half().contiguous().share_memory_()
+        # Dict: dataset_frame_idx -> precomputed-row. Caller is responsible
+        # for passing FRAME indices (Plan-v2 §Step 3a Option A).
         self._radseg_kf_idx_dict = {int(v): r for r, v in enumerate(kf_idx_arr.tolist())}
         K_out = self._radseg_feats_ba_t.shape[1]
+        head = [(r, int(kf_idx_arr[r])) for r in range(min(5, len(kf_idx_arr)))]
+        print(f"[INFO] semantic_weight: row -> frame_idx mapping (preload, "
+              f"first 5): {head}", flush=True)
         del t_ba
         if use_pca:
             del mean_t, comps_t

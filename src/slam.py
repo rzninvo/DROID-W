@@ -226,7 +226,48 @@ class SLAM:
                 self.video.semantic_weight_aware = False
                 return
         feats = feats_npz['lang_aligned_feats']
-        kf_indices = feats_npz['kf_indices']
+        # ── Plan-v2 §Step 3a Option A: use kf_global_indices (dataset frame
+        # index per row), NOT kf_indices (local KF position [0..N-1]). The
+        # old (schema v1) consumer path looked up frame_idx in a dict keyed by
+        # local position → mostly-wrong row or miss. Reject v1 files unless
+        # the legacy_override flag is set; otherwise build the mapping from
+        # the v2 kf_global_indices field. ──
+        schema_version = int(feats_npz.get('schema_version', np.int64(1)))
+        legacy_override = bool(sw_cfg.get('legacy_override_v1', False))
+        if 'kf_global_indices' not in feats_npz.files:
+            if legacy_override:
+                print(f"[WARN] semantic_weight: {npz_path} is schema v1 (no "
+                      f"kf_global_indices); legacy_override_v1=True so falling "
+                      f"back to kf_indices (identity). Lookup will be wrong "
+                      f"for any KF whose frame_idx != local position.",
+                      flush=True)
+                kf_global_indices = feats_npz['kf_indices'].astype(np.int64)
+            else:
+                print(f"[WARN] semantic_weight: {npz_path} lacks "
+                      f"'kf_global_indices' (schema v1, Plan-v2 §Step 3a "
+                      f"identified this as the source of D.2's mostly-wrong "
+                      f"feature lookup). Re-run scripts/precompute_radseg_features.py "
+                      f"or set tracking.semantic_weight.legacy_override_v1=True "
+                      f"to use the broken v1 contract anyway. Disabling D.2.",
+                      flush=True)
+                self.video.semantic_weight_aware = False
+                return
+        else:
+            kf_global_indices = feats_npz['kf_global_indices'].astype(np.int64)
+            # Detect the v1-but-saved-as-v2 case (legacy precompute saved
+            # kf_global_indices = kf_indices). If global == local AND not a
+            # match against any plausible frame-index pattern, warn loudly.
+            kf_local = feats_npz['kf_indices'].astype(np.int64)
+            if (schema_version < 2 and
+                    np.array_equal(kf_global_indices, kf_local) and
+                    not legacy_override):
+                print(f"[WARN] semantic_weight: {npz_path} stores "
+                      f"kf_global_indices == kf_indices (legacy identity); "
+                      f"schema_version={schema_version} < 2. Re-precompute "
+                      f"to get true frame indices, or set legacy_override_v1=True. "
+                      f"Disabling D.2 to avoid the silent bug.", flush=True)
+                self.video.semantic_weight_aware = False
+                return
         radio_version = str(feats_npz.get('radio_version', np.array('unknown')))
         lang_adaptor = str(feats_npz.get('lang_adaptor', np.array('unknown')))
         # PCA-256 compression cuts the per-KF buffer by 6x (1536 -> 256 dims).
@@ -256,9 +297,13 @@ class SLAM:
                   flush=True)
         print(f"[INFO] semantic_weight: loaded radseg_features from {npz_path}; "
               f"{feats.shape} dtype={feats.dtype}, radio={radio_version}, "
-              f"adaptor={lang_adaptor}, N_kf_precomp={len(kf_indices)}.",
-              flush=True)
-        self.video.preload_radseg_features(kf_indices, feats,
+              f"adaptor={lang_adaptor}, schema_version={schema_version}, "
+              f"N_kf_precomp={len(kf_global_indices)}.", flush=True)
+        # First few mappings — would have caught the v1 bug immediately.
+        head = kf_global_indices[:5].tolist()
+        print(f"[INFO] semantic_weight: row -> frame_idx mapping (first 5): "
+              f"{list(enumerate(head))}", flush=True)
+        self.video.preload_radseg_features(kf_global_indices, feats,
                                            pca_mean=pca_mean,
                                            pca_components=pca_components)
 

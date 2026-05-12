@@ -266,20 +266,28 @@ def main() -> int:
         feats_ba = _pca_project(feats_ba, mean_t, comps_t)
     feats_ba = feats_ba / (feats_ba.norm(dim=1, keepdim=True) + 1e-8)
 
-    # Map KF position (DROID-W) -> precompute row.
-    # NOTE: the precompute writes `kf_indices = arange(N)` and
-    # `kf_global_indices` is also identity in legacy `--scene <output_dir>`
-    # mode (precompute_radseg_features.py:268). Neither field stores the
-    # dataset frame index. Since the precompute iterates over the SAME
-    # video.npz, radseg row r corresponds 1:1 to video KF position r. Map
-    # by position, not by frame index.
+    # Map KF (DROID-W) -> precompute row using kf_global_indices when
+    # available (schema v2, Plan-v2 §Step 3a Option A). Falls back to KF
+    # position only if v1 (legacy identity) for backward compat.
     n_precomp = feats_ba.shape[0]
-    feat_row_per_kf = np.arange(N_kf, dtype=np.int64)
-    feat_row_per_kf = np.where(feat_row_per_kf < n_precomp, feat_row_per_kf, -1)
+    schema = int(feats_npz.get("schema_version", np.int64(1)))
+    if "kf_global_indices" in feats_npz.files and schema >= 2:
+        kf_global = feats_npz["kf_global_indices"].astype(np.int64)
+        frame_to_row = {int(f): r for r, f in enumerate(kf_global.tolist())}
+        feat_row_per_kf = np.array(
+            [frame_to_row.get(int(kf_to_gt[i]), -1) for i in range(N_kf)],
+            dtype=np.int64,
+        )
+        mode = f"kf_global_indices (schema v{schema}) -- proper frame-idx lookup"
+    else:
+        # Legacy v1 fallback: position-based mapping (audit-only workaround;
+        # only correct when precompute + audit share the same video.npz).
+        feat_row_per_kf = np.arange(N_kf, dtype=np.int64)
+        feat_row_per_kf = np.where(feat_row_per_kf < n_precomp, feat_row_per_kf, -1)
+        mode = "position fallback (v1 npz)"
     n_missing = int((feat_row_per_kf < 0).sum())
-    print(f"[step3a] feature coverage: {N_kf - n_missing}/{N_kf} KFs have "
-          f"precomputed features (mapping by KF position, since precompute "
-          f"stores identity kf_indices)", flush=True)
+    print(f"[step3a] feature coverage: {N_kf - n_missing}/{N_kf} KFs ({mode})",
+          flush=True)
 
     # ── 6. Build edge graph and compute per-edge stats
     scale_x = W_ba / W_img

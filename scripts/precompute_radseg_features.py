@@ -135,8 +135,24 @@ def main() -> int:
         if N_full == 0:
             print(f"[ERR] {npz_path} has 0 keyframes — nothing to ground", flush=True)
             return 1
-        # Mapping local-KF → global-frame is identity in legacy-video.npz mode.
-        kf_global_indices = np.arange(N_full, dtype=np.int64)
+        # ── Plan-v2 §Step 3a Option A fix (was identity == KF position) ──
+        # video.npz stores per-KF dataset frame index as `timestamps` (fp32,
+        # integer values like 0, 9, 18, ... in TUM at stride 9). Carry it
+        # forward into kf_global_indices so the SLAM-time consumer can map
+        # frame_idx -> precompute row via this field, not via kf_indices
+        # (which is just the local KF position).
+        if "timestamps" in z.files:
+            kf_global_indices = z["timestamps"][:N_full].astype(np.int64)
+            print(f"[setup] kf_global_indices: legacy-video.npz mode, taken from "
+                  f"video['timestamps'][:{N_full}] (range "
+                  f"[{kf_global_indices.min()}, {kf_global_indices.max()}])",
+                  flush=True)
+        else:
+            print(f"[WARN] features: legacy video.npz lacks 'timestamps' field; "
+                  f"kf_global_indices falls back to identity (only valid if the "
+                  f"SLAM consumer never indexes by frame_idx). Schema v1 fallback.",
+                  flush=True)
+            kf_global_indices = np.arange(N_full, dtype=np.int64)
     else:
         # Stream from dataset.
         from src.utils.datasets import get_dataset
@@ -245,6 +261,31 @@ def main() -> int:
     print(f"[done] encoded {N} keyframes in {walltime:.1f}s "
           f"(mean {1000*walltime/N:.1f} ms/kf)", flush=True)
 
+    # ── Plan-v2 §Step 3a Option A sanity-check the index contract ──
+    kf_idx_local = np.arange(N, dtype=np.int64)
+    kf_idx_global = kf_global_indices[:N].astype(np.int64)
+    assert len(kf_idx_global) == N, (
+        f"kf_global_indices length {len(kf_idx_global)} != N={N}")
+    assert len(np.unique(kf_idx_global)) == N, (
+        f"kf_global_indices has duplicates: "
+        f"{N - len(np.unique(kf_idx_global))} repeats")
+    assert (kf_idx_global >= 0).all(), (
+        f"kf_global_indices contains negatives: min={kf_idx_global.min()}")
+    # Detect the exact old bug: legacy-mode identity that doesn't match the
+    # actual frame indices known from video.npz. Hard-fail at save time so
+    # nobody downstream silently uses the wrong contract.
+    if stream_mode == "video.npz" and "timestamps" in z.files:
+        video_ts = z["timestamps"][:N].astype(np.int64)
+        if (np.array_equal(kf_idx_global, kf_idx_local)
+                and not np.array_equal(video_ts, kf_idx_local)):
+            raise RuntimeError(
+                "[PRECOMPUTE BUG] kf_global_indices == local KF positions but "
+                "video.timestamps != identity — kf_global_indices was not "
+                "set to the true dataset frame index. Refusing to save the "
+                "broken artefact. (Plan-v2 §Step 3a Option A regression guard.)")
+    print(f"[index] schema_version=2  kf_indices (local)[:5]={kf_idx_local[:5].tolist()}  "
+          f"kf_global_indices (frame)[:5]={kf_idx_global[:5].tolist()}", flush=True)
+
     np.savez(
         out_path,
         lang_aligned_feats=feats_cpu,             # (N, D, hp, wp) fp16
@@ -260,13 +301,15 @@ def main() -> int:
         n_keyframes_in_video=np.int64(N_full),
         image_hw=np.asarray([H, W], dtype=np.int64),
         feat_hw=np.asarray([hp, wp], dtype=np.int64),
-        # kf_indices stores the LOCAL KF position within this scene's
-        # `radseg_features.npz` — useful for offsets. The mapping to the
-        # original dataset frame index is `kf_global_indices` (added per
-        # Reviewer-2 audit, B.0 plan #B0): identity for legacy video.npz
-        # mode, true global indices for streaming-from-dataset mode.
-        kf_indices=np.arange(N, dtype=np.int64),
-        kf_global_indices=kf_global_indices[:N].astype(np.int64),
+        # Schema v2 (Plan-v2 §Step 3a Option A): kf_indices is the LOCAL
+        # row [0..N-1]; kf_global_indices is the dataset frame index used at
+        # SLAM time for the tstamp -> row lookup. Schema v1 (Report 18 era)
+        # incorrectly wrote identity in both fields in legacy-video.npz mode;
+        # consumers must use kf_global_indices and refuse v1 files that
+        # claim legacy mode unless explicitly overriding.
+        schema_version=np.int64(2),
+        kf_indices=kf_idx_local,
+        kf_global_indices=kf_idx_global,
         walltime_seconds=np.float32(walltime),
     )
     size_mb = out_path.stat().st_size / 1024 / 1024
