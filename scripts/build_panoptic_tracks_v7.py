@@ -99,14 +99,19 @@ def main() -> int:
     print(f"[load] video: poses={poses.shape}, droid_disps_up={droid_up.shape}, "
           f"scale={scale:.4f}", flush=True)
 
-    if droid_up.shape[1:] != (H_mask, W_mask):
-        print(f"[ERR] mask res {H_mask}x{W_mask} != droid_disps_up res "
-              f"{droid_up.shape[1:]}", flush=True)
-        return 1
-    intr_scale = H_mask / (intr_ba[0, 3] * 2)  # crude scale, expect ~8.x
-    # Actually: BA grid is 48x64, mask res is 384x512 -> exact scale = 8.
-    # We use exact 8x; the cy/cx values check out (cy*8=198 ~ H/2=192, ok).
-    intr_factor = float(H_mask / 48)  # 384/48 = 8.0
+    # If the mask resolution does not match depth, we down/up-sample masks
+    # on the fly to the depth resolution (nearest-neighbour, lossless for
+    # boolean masks). The track is recorded in the original mask flat-list
+    # order, so renderers can still use the input masks at native res.
+    Hd, Wd = droid_up.shape[1], droid_up.shape[2]
+    needs_mask_resize = (Hd, Wd) != (H_mask, W_mask)
+    if needs_mask_resize:
+        print(f"[setup] mask {H_mask}x{W_mask} != depth {Hd}x{Wd}; "
+              f"will resize masks to {Hd}x{Wd} for back-projection",
+              flush=True)
+        import cv2 as _cv
+        cv2_inter = _cv.INTER_NEAREST
+    intr_factor = float(Hd / 48)
     intrinsics_full = intr_ba * intr_factor
     print(f"[setup] intrinsics x{intr_factor:.0f} -> "
           f"fx={intrinsics_full[0,0]:.2f} fy={intrinsics_full[0,1]:.2f} "
@@ -157,6 +162,9 @@ def main() -> int:
         s_off, e_off = int(offsets[k]), int(offsets[k + 1])
         for m_idx_in_kf, m_global in enumerate(range(s_off, e_off)):
             mask = masks[m_global]                    # (H_mask, W_mask) bool
+            if needs_mask_resize:
+                mask = _cv.resize(mask.astype(np.uint8), (Wd, Hd),
+                                  interpolation=cv2_inter).astype(bool)
             mask_sub = mask[::s, ::s]                 # (Hs, Ws)
             keep = mask_sub & valid_sub
             if keep.sum() < args.min_points:
