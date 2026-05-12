@@ -38,3 +38,12 @@ thirdparty/simple-knn
 *.token
 weights/
 
+
+# Vendored CropFormer / qqlu/Entity (cloned manually -- not a git submodule yet).
+# Re-clone via:  git clone --depth 1 https://github.com/qqlu/Entity.git DROID-W/thirdparty/Entity
+# Patch the MSDA CUDA op for torch 2.7:  s/value.type()/value.scalar_type()/ in
+#   thirdparty/Entity/Entityv2/CropFormer/mask2former/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
+# Build:  cd thirdparty/Entity/Entityv2/CropFormer/mask2former/modeling/pixel_decoder/ops && python setup.py build install
+thirdparty/Entity/
+thirdparty/RADIO-ViPE/
+
