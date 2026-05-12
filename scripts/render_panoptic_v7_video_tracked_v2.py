@@ -59,9 +59,18 @@ def main() -> int:
     print(f"[setup] RGB native res = {H}x{W}; upsampling masks {Hm}x{Wm} -> {H}x{W}",
           flush=True)
 
-    rng = np.random.default_rng(0)
+    # HSV golden-ratio palette: each label id gets a hue offset of phi
+    # times the previous, so adjacent ids land in maximally-different hues.
+    # High saturation and value -> distinct colours even for many labels.
     n_lab = int(global_ids.max()) + 1
-    palette = rng.integers(64, 256, size=(max(n_lab, 1), 3)).astype(np.uint8)
+    phi = 0.6180339887498949
+    hues = ((np.arange(max(n_lab, 1)) * phi) % 1.0).astype(np.float32)
+    # Vary saturation/value slightly per id for extra contrast.
+    sats = 0.55 + 0.45 * ((np.arange(max(n_lab, 1)) * 0.7) % 1.0)
+    vals = 0.75 + 0.25 * ((np.arange(max(n_lab, 1)) * 0.3 + 0.5) % 1.0)
+    hsv = np.stack([hues * 179.0, sats * 255.0, vals * 255.0], axis=-1)
+    hsv = hsv.reshape(-1, 1, 3).astype(np.uint8)
+    palette = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).reshape(-1, 3)
     palette[0] = (40, 40, 40)  # label 0 (never used) -> dark grey
 
     # Pre-build a "skipped" greyscale palette indexed by per-mask hash

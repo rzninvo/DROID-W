@@ -79,6 +79,15 @@ def main() -> int:
                    help="upper clip on metric depth (m)")
     p.add_argument("--min-points", default=50, type=int,
                    help="drop a mask if its valid 3D point count is below this")
+    p.add_argument("--enforce-within-kf-distinct", default=1, type=int,
+                   help="if 1, two CropFormer entities in the same KF cannot "
+                        "share a global track ID (defends against monocular "
+                        "voxel collisions; OVI-MAP sec.3.1 has no such guard)")
+    p.add_argument("--voxel-decay-window", default=5, type=int,
+                   help="ignore voxel labels not refreshed in the last N KFs "
+                        "when computing Omega. Static structure is re-voted "
+                        "every KF so stays fresh; transient labels from "
+                        "movers decay out. Set to 0 to disable decay.")
     args = p.parse_args()
 
     t0 = time.time()
@@ -126,6 +135,10 @@ def main() -> int:
     voxel_votes: dict[tuple[int, int, int], Counter[int]] = {}
     # Per-voxel current argmax label (cached, recomputed when votes change)
     voxel_label: dict[tuple[int, int, int], int] = {}
+    # Per-voxel last KF index that voted for this voxel (for time decay).
+    voxel_last_kf: dict[tuple[int, int, int], int] = {}
+    use_decay = args.voxel_decay_window > 0
+    use_distinct = args.enforce_within_kf_distinct != 0
 
     n_masks_total = int(masks.shape[0])
     global_track_ids = -np.ones(n_masks_total, dtype=np.int64)  # -1 = unassigned
@@ -160,6 +173,10 @@ def main() -> int:
         vox_ijk = np.floor(X_world_sub * inv_vox).astype(np.int32)
 
         s_off, e_off = int(offsets[k]), int(offsets[k + 1])
+        # Within-KF distinctness: track labels already taken by another
+        # CropFormer entity in this same KF.
+        used_labels_this_kf: set[int] = set()
+        decay_min_kf = k - args.voxel_decay_window  # voxel must be >= this
         for m_idx_in_kf, m_global in enumerate(range(s_off, e_off)):
             mask = masks[m_global]                    # (H_mask, W_mask) bool
             if needs_mask_resize:
@@ -172,21 +189,29 @@ def main() -> int:
                 continue
             ijk = vox_ijk[keep]                       # (P, 3) int32
 
-            # Compute Omega_{j,k} = # of P_tj points landing in voxels with label k.
-            # Walk through ijk once, look up voxel_label[(i,j,k_)] if present.
+            # Compute Omega_{j,k} = # of P_tj points landing in voxels with
+            # label k. Voxels not refreshed in the last decay window are
+            # treated as unlabeled (defends against transient mover labels).
             omega = Counter()
             for row in ijk:
                 key = (int(row[0]), int(row[1]), int(row[2]))
                 lab = voxel_label.get(key, 0)
-                if lab != 0:
-                    omega[lab] += 1
+                if lab == 0:
+                    continue
+                if use_decay and voxel_last_kf.get(key, -10**9) < decay_min_kf:
+                    continue
+                omega[lab] += 1
 
             P_size = ijk.shape[0]
+            # Pick best non-already-used label this KF (within-KF distinctness).
+            k_star, omega_best, ratio = 0, 0, 0.0
             if omega:
-                k_star, omega_best = omega.most_common(1)[0]
-                ratio = omega_best / max(P_size, 1)
-            else:
-                k_star, omega_best, ratio = 0, 0, 0.0
+                for cand_lab, cand_n in omega.most_common():
+                    if use_distinct and cand_lab in used_labels_this_kf:
+                        continue
+                    k_star, omega_best = cand_lab, cand_n
+                    ratio = cand_n / max(P_size, 1)
+                    break
 
             if ratio > args.theta_assoc and k_star != 0:
                 assigned_label = k_star
@@ -196,9 +221,11 @@ def main() -> int:
                 next_label += 1
                 n_new += 1
             global_track_ids[m_global] = assigned_label
+            used_labels_this_kf.add(assigned_label)
             omega_log.append((k, m_idx_in_kf, omega_best, P_size))
 
-            # Vote and update voxel labels for THIS mask's points.
+            # Vote and update voxel labels for THIS mask's points; refresh
+            # the per-voxel last-kf timestamp for the decay logic.
             for row in ijk:
                 key = (int(row[0]), int(row[1]), int(row[2]))
                 cnt = voxel_votes.setdefault(key, Counter())
@@ -206,6 +233,7 @@ def main() -> int:
                 # Update voxel argmax label
                 top = cnt.most_common(1)[0][0]
                 voxel_label[key] = top
+                voxel_last_kf[key] = k
 
         t_kf_total += time.time() - t_kf
         if (k + 1) % 10 == 0 or k == n_kf - 1:
