@@ -130,6 +130,49 @@ class DepthVideo:
             self.dynamic_masks = None
             self.semantic_mask_eps = 0.0
 
+        # ── Goal D.2: RADIO/RADSeg semantic-cosine confidence weight ──
+        # Per plan-v2 Step 2:
+        #   r_sem(u) = 1 - cos(F_i(u), F_j(mu_ij(u)))
+        #   w_sem(u) = clip(exp(-beta * r_sem(u)), w_min, 1)
+        # Multiplied into BA weight in self.ba() AFTER Goal C's mask multiply.
+        # Composes with Goal C (mask gates a pixel to ~0; w_sem then softly
+        # down-weights low-similarity correspondences in the still-active
+        # region). Treated as a fixed weight — no gradient flow to {T, d}.
+        #
+        # True branch bypass: any of activate=False, beta<=0, OR w_min>=1
+        # short-circuits to "no buffer, no preload, no ba() compute". All
+        # three are bit-identical to vanilla DROID-W per plan-v2 §Step 2 gates.
+        sw_cfg = cfg.get('tracking', {}).get('semantic_weight', {})
+        self.semantic_weight_aware = bool(sw_cfg.get('activate', False))
+        self.semantic_weight_beta = float(sw_cfg.get('beta', 0.0))
+        self.semantic_weight_min = float(sw_cfg.get('w_min', 1.0))
+        if (self.semantic_weight_aware and self.semantic_weight_beta > 0
+                and self.semantic_weight_min < 1.0):
+            self.semantic_weight_K = int(sw_cfg.get('K', 1536))
+            # Per-KF L2-normalised features at the BA coarse grid, fp16 storage.
+            # D=1536, buffer=350, h=48, w=64  ->  ~3.3 GB on the SLAM device.
+            self.radseg_feats_resize = torch.zeros(
+                buffer, self.semantic_weight_K,
+                ht//self.down_scale, wd//self.down_scale,
+                device=self.device, dtype=torch.float16,
+            ).share_memory_()
+            # Per-slot loaded flag — True iff a precomputed radseg row exists
+            # for this slot's tstamp. ba() restricts D.2 weight to edges where
+            # BOTH endpoints are loaded; unmatched slots silently skip D.2.
+            self.radseg_feats_loaded = torch.zeros(
+                buffer, device=self.device, dtype=torch.bool,
+            ).share_memory_()
+            # Populated by preload_radseg_features() before spawn.
+            self._radseg_kf_idx_dict = None
+            self._radseg_feats_ba_t = None
+        else:
+            self.radseg_feats_resize = None
+            self.radseg_feats_loaded = None
+            self._radseg_kf_idx_dict = None
+            self._radseg_feats_ba_t = None
+            # Force-disable so __item_setter and ba() short-circuit identically.
+            self.semantic_weight_aware = False
+
     def preload_dynamic_masks(self, frame_masks_full_res):
         """Cache a per-frame full-resolution dynamic mask array.
 
@@ -160,6 +203,60 @@ class DepthVideo:
         assert self._frame_dynamic_masks_full_t.device == self.dynamic_masks.device, (
             f"semantic_mask: device mismatch — full_t on {self._frame_dynamic_masks_full_t.device} "
             f"but dynamic_masks on {self.dynamic_masks.device}"
+        )
+
+    def preload_radseg_features(self, kf_indices, lang_aligned_feats):
+        """Resample precomputed RADIO+SigLIP-2 features to the BA grid and
+        L2-normalise. Called once at SLAM start (slam.py) before tracker fork.
+
+        Args:
+            kf_indices: (N_precomp,) int — dataset frame idx for each
+                precomputed KF row.
+            lang_aligned_feats: (N_precomp, D, h_native, w_native) numpy
+                from radseg_features.npz.
+
+        Sets:
+            self._radseg_kf_idx_dict: {frame_idx: row_idx}
+            self._radseg_feats_ba_t: (N_precomp, D, h_ba, w_ba) fp16 GPU,
+                L2-normalised per pixel, share_memory_()'d for spawn-safe IPC.
+        """
+        if not self.semantic_weight_aware:
+            return
+        kf_idx_arr = np.asarray(kf_indices, dtype=np.int64)
+        feats = np.asarray(lang_aligned_feats)
+        if feats.ndim != 4:
+            print(f"[WARN] semantic_weight: lang_aligned_feats shape {feats.shape} "
+                  f"is not 4D (N, D, h, w) — disabling D.2.", flush=True)
+            self.semantic_weight_aware = False
+            self.radseg_feats_resize = None
+            return
+        N_p, D, h_native, w_native = feats.shape
+        if D != self.semantic_weight_K:
+            print(f"[WARN] semantic_weight: feature dim D={D} != configured "
+                  f"K={self.semantic_weight_K} — disabling D.2.", flush=True)
+            self.semantic_weight_aware = False
+            self.radseg_feats_resize = None
+            return
+        h_ba = self.ht // self.down_scale
+        w_ba = self.wd // self.down_scale
+        # Resample + L2-normalise once at preload (fp32 math, fp16 storage).
+        t = torch.from_numpy(feats).to(self.device).float()
+        t_ba = F.interpolate(t, size=(h_ba, w_ba), mode='bilinear', align_corners=False)
+        t_ba = t_ba / (t_ba.norm(dim=1, keepdim=True) + 1e-8)
+        self._radseg_feats_ba_t = t_ba.half().contiguous().share_memory_()
+        self._radseg_kf_idx_dict = {int(t): r for r, t in enumerate(kf_idx_arr.tolist())}
+        del t, t_ba
+        torch.cuda.empty_cache()
+        print(f"[INFO] semantic_weight: loaded N={N_p} radseg KFs ({D}-d, "
+              f"native ({h_native},{w_native}) -> BA ({h_ba},{w_ba})) "
+              f"beta={self.semantic_weight_beta}, w_min={self.semantic_weight_min}.",
+              flush=True)
+        # Same device as the per-slot buffer; otherwise __item_setter would
+        # cross-device-copy silently. Assert loud per CLAUDE.md §6.
+        assert self._radseg_feats_ba_t.device == self.radseg_feats_resize.device, (
+            f"semantic_weight: device mismatch — precomp on "
+            f"{self._radseg_feats_ba_t.device} but buffer on "
+            f"{self.radseg_feats_resize.device}"
         )
 
     def get_lock(self):
@@ -264,6 +361,34 @@ class DepthVideo:
                 else:
                     print(f"[WARN] semantic_mask: tstamp_idx {ts_idx} out of range "
                           f"[0,{n_full}) at slot {slot} — leaving mask=1.0", flush=True)
+
+        # ── Goal D.2: copy precomputed radseg features for this slot, keyed
+        # by tstamp (frame idx). Mirrors Goal C's batched-vs-int dispatch.
+        # When the tstamp isn't in the precomputed map, the slot stays at
+        # zeros and `radseg_feats_loaded[slot]=False`, causing ba() to skip
+        # D.2 for all edges touching this slot (plan-v2 Step 2). ──
+        if self.semantic_weight_aware and self._radseg_feats_ba_t is not None:
+            tstamps_arg = item[0]
+            n_precomp = self._radseg_feats_ba_t.shape[0]
+            if torch.is_tensor(tstamps_arg) and tstamps_arg.numel() > 1:
+                M = tstamps_arg.numel()
+                if isinstance(index, slice):
+                    slot_start = index.start if index.start is not None else 0
+                else:
+                    slot_start = int(index[0]) if torch.is_tensor(index) else int(index)
+                pairs_sw = [(slot_start + k, int(tstamps_arg[k])) for k in range(M)]
+            else:
+                pairs_sw = [(index, int(tstamps_arg))]
+            for slot, ts_idx in pairs_sw:
+                row = self._radseg_kf_idx_dict.get(int(ts_idx))
+                if row is not None and 0 <= row < n_precomp:
+                    self.radseg_feats_resize[slot] = self._radseg_feats_ba_t[row]
+                    self.radseg_feats_loaded[slot] = True
+                else:
+                    self.radseg_feats_loaded[slot] = False
+                    print(f"[WARN] semantic_weight: no radseg feature for "
+                          f"tstamp={ts_idx} (slot={slot}); D.2 weight skipped "
+                          f"for edges touching this slot.", flush=True)
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -461,6 +586,46 @@ class DepthVideo:
             if self.semantic_mask_aware and self.dynamic_masks is not None:
                 m = self.dynamic_masks[ii].clamp_min(self.semantic_mask_eps)  # [n_edges, h, w]
                 weight = weight * m[:, None, :, :]  # broadcast over (u, v) flow channels
+
+            # ── Goal D.2: RADIO/RADSeg semantic-cosine confidence weight ──
+            # Per plan-v2 Step 2 (gated by activate + beta>0 + w_min<1; the
+            # ctor short-circuits any of these to a no-op). Computes
+            #     w_sem = clip(exp(-beta * (1 - cos(F_i, F_j(mu_ij)))), w_min, 1)
+            # and multiplies into `weight` AFTER Goal C. Treated as a fixed
+            # weight — no gradient flow to {T, d}. Restricted to edges where
+            # BOTH endpoints have radseg features loaded (others get w_sem=1).
+            if (self.semantic_weight_aware and self.radseg_feats_resize is not None
+                    and self.radseg_feats_loaded is not None):
+                loaded_i = self.radseg_feats_loaded[ii]
+                loaded_j = self.radseg_feats_loaded[jj]
+                edge_valid = loaded_i & loaded_j
+                if bool(edge_valid.any()):
+                    h_ba = self.ht // self.down_scale
+                    w_ba = self.wd // self.down_scale
+                    F_i = self.radseg_feats_resize[ii].float()           # [E, D, h, w]
+                    F_j = self.radseg_feats_resize[jj].float()
+                    # target is [E, 2, h, w] in pixel coords [0, w-1] x [0, h-1]
+                    mu_u = target[:, 0, :, :]                            # [E, h, w]
+                    mu_v = target[:, 1, :, :]
+                    grid_x = 2.0 * mu_u / max(w_ba - 1, 1) - 1.0
+                    grid_y = 2.0 * mu_v / max(h_ba - 1, 1) - 1.0
+                    grid = torch.stack([grid_x, grid_y], dim=-1)         # [E, h, w, 2]
+                    F_j_at_mu = F.grid_sample(
+                        F_j, grid, mode='bilinear',
+                        padding_mode='border', align_corners=False,
+                    )
+                    # Re-normalise (bilinear of unit vectors is not unit-norm).
+                    F_j_at_mu = F_j_at_mu / (F_j_at_mu.norm(dim=1, keepdim=True) + 1e-8)
+                    cs = (F_i * F_j_at_mu).sum(dim=1)                    # [E, h, w]
+                    r_sem = (1.0 - cs).clamp(min=0)
+                    w_sem = torch.exp(-self.semantic_weight_beta * r_sem)
+                    w_sem = w_sem.clamp(min=self.semantic_weight_min, max=1.0)
+                    # Edges with missing endpoints stay at w_sem=1 (no D.2 effect).
+                    w_sem = torch.where(
+                        edge_valid[:, None, None].expand_as(w_sem),
+                        w_sem, torch.ones_like(w_sem),
+                    )
+                    weight = weight * w_sem[:, None, :, :]
 
             # if there is NaN of inf value for self.affine_weights, assert
             if self.uncertainty_aware:

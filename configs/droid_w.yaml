@@ -144,6 +144,19 @@ tracking:
     queries: ["person"]              # used only by precompute script
     sim_threshold: 0.40              # used only by precompute script
 
+  # ── Goal D.2: RADIO/RADSeg semantic-cosine confidence weight (plan-v2 Step 2).
+  # Multiplies w_sem = clip(exp(-beta * (1 - cos(F_i, F_j(mu_ij)))), w_min, 1)
+  # into the per-pixel BA weight AFTER Goal C's binary mask. Treated as a fixed
+  # weight — no gradient to {T, d}. Disabled-mode regression: activate=False,
+  # beta<=0, OR w_min>=1 all bypass the entire D.2 path bit-identically
+  # to vanilla DROID-W (plan-v2 §Step 2 regression gates).
+  semantic_weight:
+    activate: False                  # default off (backwards-compat)
+    path: radseg_features.npz        # relative to data.input_folder, fallback save_dir
+    beta: 5.0                        # exponent steepness; sweep {2, 5, 10}
+    w_min: 0.1                       # clamp floor; sweep {0.05, 0.1}; >=1 disables
+    K: 1536                          # feature dim (c-radio_v3-b + siglip2 -> 1536)
+
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 

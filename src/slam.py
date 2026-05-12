@@ -105,6 +105,9 @@ class SLAM:
         # other share_memory_()'d CUDA tensors. MUST run before any
         # mp.Process(...) calls in run() so both are populated pre-pickle.
         self._maybe_load_semantic_masks(cfg, stream)
+        # ── Goal D.2: load precomputed radseg features BEFORE process spawn
+        # (same spawn-pickle lifecycle as semantic_mask above). ──
+        self._maybe_load_radseg_features(cfg, stream)
 
         self.ba = Backend(self.droid_net, self.video, self.cfg)
 
@@ -182,6 +185,55 @@ class SLAM:
         print(f"[INFO] semantic_mask: loaded {masks.shape} dtype={masks.dtype} "
               f"from {npz_path}  ({n_dyn:.2f}% dynamic).", flush=True)
         self.video.preload_dynamic_masks(masks)
+
+    def _maybe_load_radseg_features(self, cfg, stream):
+        """Load precomputed RADIO+SigLIP-2 features (Plan B v5 radseg_features.npz)
+        and hand them to DepthVideo for D.2 weight composition. Silent no-op
+        when tracking.semantic_weight.activate=False (or beta<=0, w_min>=1
+        per plan-v2 Step 2's bypass switches in DepthVideo.__init__).
+
+        Search order (per CLAUDE.md §6 — log what we did, no silent fallbacks):
+          1) <data.input_folder>/<semantic_weight.path>
+          2) <output>/<scene>/<semantic_weight.path>  (e.g. SLAM save_dir)
+        """
+        if not getattr(self.video, 'semantic_weight_aware', False):
+            return
+        sw_cfg = cfg.get('tracking', {}).get('semantic_weight', {})
+        rel_path = sw_cfg.get('path', 'radseg_features.npz')
+        from pathlib import Path as _Path
+        candidates = []
+        input_folder = cfg.get('data', {}).get('input_folder', '')
+        if input_folder and 'ROOT_FOLDER_PLACEHOLDER' in input_folder:
+            input_folder = input_folder.replace(
+                'ROOT_FOLDER_PLACEHOLDER', cfg['data'].get('root_folder', '.'))
+        if input_folder:
+            candidates.append(_Path(input_folder) / rel_path)
+        save_dir = f"{cfg['data']['output']}/{cfg['scene']}"
+        candidates.append(_Path(save_dir) / rel_path)
+        npz_path = next((p for p in candidates if p.exists()), None)
+        if npz_path is None:
+            print(f"[WARN] semantic_weight.activate=True but radseg feature file "
+                  f"not found in any of {[str(p) for p in candidates]} — "
+                  f"disabling D.2 (SLAM proceeds without semantic weight).",
+                  flush=True)
+            self.video.semantic_weight_aware = False
+            return
+        feats_npz = np.load(str(npz_path))
+        for field in ('lang_aligned_feats', 'kf_indices'):
+            if field not in feats_npz.files:
+                print(f"[WARN] semantic_weight: {npz_path} missing '{field}' "
+                      f"(found {feats_npz.files}) — disabling D.2.", flush=True)
+                self.video.semantic_weight_aware = False
+                return
+        feats = feats_npz['lang_aligned_feats']
+        kf_indices = feats_npz['kf_indices']
+        radio_version = str(feats_npz.get('radio_version', np.array('unknown')))
+        lang_adaptor = str(feats_npz.get('lang_adaptor', np.array('unknown')))
+        print(f"[INFO] semantic_weight: loaded radseg_features from {npz_path}; "
+              f"{feats.shape} dtype={feats.dtype}, radio={radio_version}, "
+              f"adaptor={lang_adaptor}, N_kf_precomp={len(kf_indices)}.",
+              flush=True)
+        self.video.preload_radseg_features(kf_indices, feats)
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]
