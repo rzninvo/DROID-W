@@ -140,6 +140,16 @@ def main() -> int:
                    help="how many top tracks to display per query "
                         "(only those above tau are matches; the rest are "
                         "shown for context with rejected status)")
+    p.add_argument("--top-rel-window", default=0.020, type=float,
+                   help="precision filter: after the LERF tau-gate, only "
+                        "keep tracks whose relevancy is within this much of "
+                        "the top-1 relevancy. Cuts the loose tail at the "
+                        "edge of the natural cluster.")
+    p.add_argument("--max-matches", default=5, type=int,
+                   help="safety cap: never return more than this many "
+                        "tracks per query. Multi-instance is fine, but a "
+                        "single query returning 20 means the rel-window is "
+                        "too loose.")
     p.add_argument("--out-json", default=None, type=str)
     args = p.parse_args()
 
@@ -211,8 +221,20 @@ def main() -> int:
         cos_q = phi @ q_emb[qi]                                        # (N_valid,)
 
         order = np.argsort(-rel_q)
-        matches = [(int(valid_track_ids[i]), float(rel_q[i]), float(cos_q[i]))
+        # Stage 1: LERF tau-gate (open-set rejection)
+        passers = [(int(valid_track_ids[i]), float(rel_q[i]), float(cos_q[i]))
                    for i in order if rel_q[i] > args.tau_relevancy]
+        # Stage 2: relative-Delta window from top-1 (precision filter)
+        #          + max-matches safety cap. This is what keeps "person"
+        #          retrieval at ~2 visible persons instead of 20.
+        if passers:
+            top_rel = passers[0][1]
+            matches = [m for m in passers
+                       if m[1] >= top_rel - args.top_rel_window]
+            if len(matches) > args.max_matches:
+                matches = matches[:args.max_matches]
+        else:
+            matches = []
         all_top = [(int(valid_track_ids[i]), float(rel_q[i]), float(cos_q[i]))
                    for i in order[:args.top_display]]
 
