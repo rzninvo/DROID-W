@@ -63,7 +63,7 @@ def main() -> int:
           flush=True)
 
     rgb_dir = Path(args.rgb_dir)
-    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix == ".png")
+    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix.lower() in (".png", ".jpg", ".jpeg") and not f.name.startswith("depth"))
     print(f"[load] {len(rgb_files)} TUM RGB frames in {rgb_dir}", flush=True)
 
     out_root = Path(args.out_root)

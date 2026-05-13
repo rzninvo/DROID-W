@@ -71,7 +71,7 @@ def main() -> int:
           flush=True)
 
     rgb_dir = Path(args.rgb_dir)
-    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix == ".png")
+    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix.lower() in (".png", ".jpg", ".jpeg") and not f.name.startswith("depth"))
 
     deva_dir = Path(args.deva_output)
     if not deva_dir.exists():

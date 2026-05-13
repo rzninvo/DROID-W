@@ -208,7 +208,7 @@ def main() -> int:
     intrinsics_full = intr_ba * (Hd / 48.0)
 
     rgb_dir = Path(args.rgb_dir)
-    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix == ".png")
+    rgb_files = sorted(f for f in rgb_dir.iterdir() if f.suffix.lower() in (".png", ".jpg", ".jpeg") and not f.name.startswith("depth"))
     deva_dir = Path(args.deva_png_dir)
 
     logging.info(f"refined: {masks.shape[0]} masks, {n_kf} KFs, {H_m}x{W_m}")
