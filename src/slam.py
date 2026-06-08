@@ -275,6 +275,25 @@ class SLAM:
         self.printer.print(f"File saved as {file_path}", FontColor.EVAL)
 
     def run(self):
+        # ptrace_scope-safe path: when only tracking runs (mapping off, no GUI, no
+        # rerun visualizer) there is a single worker, so run it IN THE MAIN PROCESS
+        # instead of an mp.Process. Spawning a child and sharing the CUDA DepthVideo
+        # tensors needs CUDA-IPC (pidfd_getfd), which the kernel blocks under
+        # kernel.yama.ptrace_scope=1. Running inline avoids the IPC handoff entirely.
+        # All other configs keep the original multi-process behavior below.
+        if (not self.cfg["mapping"]["enable"]) and (not self.cfg["gui"]) and (not self.cfg["droidvis"]):
+            self.startup_barrier = None
+            # tracker.run() ends with an unconditional pipe.send(end-sentinel) meant for
+            # the mapper; with no mapper we still hand it a live (unread) pipe end so the
+            # buffered send succeeds. The two intermediate sends are mapping-gated and never fire.
+            _m_pipe, _t_pipe = mp.Pipe()
+            self.tracking(_t_pipe)  # runs the tracker, then terminate() (saves video.npz + eval)
+            self.printer.terminate()
+            for process in mp.active_children():
+                process.terminate()
+                process.join()
+            return
+
         mp.set_start_method("spawn", force=True)
         exit_event = mp.Event()
 

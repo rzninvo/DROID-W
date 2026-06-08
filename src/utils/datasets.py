@@ -594,4 +594,6 @@ dataset_dict = {
     "youtube": RGB_NoPose,
     "dycheck": Dycheck,
     "droidw": RGB_NoPose,
+    "replica": Replica,
+    "scannet": ScanNet,
 }
