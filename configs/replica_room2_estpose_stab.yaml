@@ -1,0 +1,7 @@
+# HERMES variant run: Replica room2 static control with temporal-stability ARK.
+inherit_from: ./configs/room2_estpose_estpose.yaml
+scene: room2_estpose_stab
+
+tracking:
+  stability:
+    enable: True
