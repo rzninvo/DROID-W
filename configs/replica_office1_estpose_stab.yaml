@@ -1,0 +1,8 @@
+# HERMES variant run: Replica office1 (second static control) with the
+# temporal-stability ARK enabled. Gate: zero dynamic verdicts.
+inherit_from: ./configs/office1_estpose.yaml
+scene: office1_estpose_stab
+
+tracking:
+  stability:
+    enable: True
