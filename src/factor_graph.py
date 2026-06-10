@@ -2,17 +2,21 @@ import torch
 import numpy as np
 
 from src.modules.droid_net import CorrBlock, AltCorrBlock
+from src.utils.dyn_uncertainty.temporal_stability import modulate_weight
 import src.geom.projective_ops as pops
 
 
 class FactorGraph:
     # mainly inherited from GO-SLAM
-    def __init__(self, video, update_op, device="cuda:0", corr_impl="volume", max_factors=-1):
+    def __init__(self, video, update_op, device="cuda:0", corr_impl="volume", max_factors=-1, use_stability=True):
         self.video = video
         self.update_op = update_op
         self.device = device
         self.max_factors = max_factors
         self.corr_impl = corr_impl
+        # HERMES variant: graphs over feature-less frames (trajectory filler) must
+        # opt out of the temporal-stability kernel
+        self.stability_enabled = video.stability_enabled and use_stability
 
         # operator at 1/8 resolution
         self.ht = ht = video.ht // self.video.down_scale
@@ -211,7 +215,13 @@ class FactorGraph:
 
             if self.video.uncertainty_aware:
                 self.video.dino_feats[ix] = self.video.dino_feats[ix+1]
+                # keep the BA-resolution feature buffer aligned with the keyframe
+                # slots (it is consumed cross-frame by the CUDA uncertainty update
+                # and by the temporal-stability kernel)
+                self.video.dino_feats_resize[ix] = self.video.dino_feats_resize[ix+1]
                 self.video.uncertainties[ix] = self.video.uncertainties[ix+1]
+            if self.video.stability_enabled:
+                self.video.stability[ix] = self.video.stability[ix+1]
 
         m = (self.ii_inac == ix) | (self.jj_inac == ix)
         self.ii_inac[self.ii_inac >= ix] -= 1       # kfs after ix: index - 1
@@ -267,10 +277,16 @@ class FactorGraph:
             else:
                 ii, jj, target, weight = self.ii, self.jj, self.target, self.weight
 
+            # HERMES variant: temporal-stability ARK reweighting (enable=False = canonical).
+            # Gated past warmup: with the once-per-update cadence the kernel would act
+            # on the full GRU delta during bootstrap and could trap initialization.
+            if self.stability_enabled and self.video.counter.value > self.video.cfg['tracking']['warmup']:
+                weight = modulate_weight(self.video, ii, jj, target, weight)
+
             damping = .2 * self.damping[torch.unique(ii)].contiguous() + EP     # damping factor: avoid singlevalue tensor
 
             # bundle adjustment
-            self.video.ba(target, weight, damping, ii, jj, t0, t1, 
+            self.video.ba(target, weight, damping, ii, jj, t0, t1,
                 iters=itrs, lm=1e-4, ep=0.1, lr=self.video.cfg['tracking']['uncertainty_params']['lr'], 
                 weight_decay=self.video.cfg['tracking']['uncertainty_params']['weight_decay'],
                 motion_only=motion_only, 
@@ -326,8 +342,12 @@ class FactorGraph:
             target = self.target
             weight = self.weight
 
-            # dense bundle adjustment            
-            self.video.ba(target, weight, damping, self.ii, self.jj, t0, t1, 
+            # HERMES variant: temporal-stability ARK reweighting (enable=False = canonical)
+            if self.stability_enabled and self.video.counter.value > self.video.cfg['tracking']['warmup']:
+                weight = modulate_weight(self.video, self.ii, self.jj, target, weight)
+
+            # dense bundle adjustment
+            self.video.ba(target, weight, damping, self.ii, self.jj, t0, t1,
                 iters=itrs, lm=1e-5, ep=1e-2, lr=self.video.cfg['tracking']['uncertainty_params']['gba_lr'],
                 weight_decay=self.video.cfg['tracking']['uncertainty_params']['gba_weight_decay'],
                 motion_only=False, 

@@ -1,0 +1,9 @@
+# HERMES variant run: Replica office0 (static control) with the temporal-stability
+# ARK enabled. Gate: ATE and map must NOT regress vs office0_estpose baseline —
+# on a static scene S(u) should be uniformly high and the kernel a near-no-op.
+inherit_from: ./configs/replica_office0_estpose.yaml
+scene: office0_estpose_stab
+
+tracking:
+  stability:
+    enable: True

@@ -91,6 +91,16 @@ tracking:
   multiview_filter:
     thresh: 0.01    # eta in eq(6) of the paper
     visible_num: 2  # points need to be viewed by at least X cameras
+  stability:        # HERMES variant: temporal-stability adaptive robust kernel
+                    # (RADIO-ViPE/KM-ViPE port, arXiv:2604.26067 Eqs. 8-11);
+                    # enable=False keeps tracking bit-identical to canonical DROID-W.
+    enable: False
+    thresh_static: 0.75   # S >= th_s -> alpha_static (L2); reference defaults
+    thresh_movable: 0.35  # S < th_m -> alpha_dynamic
+    alpha_static: 2.0
+    alpha_huber: 1.0
+    alpha_dynamic: -2.0
+    c: 1.0                # Barron scale, in pixels of flow residual
   frontend:
     enable_loop: False      # whether to enable loop closure
     enable_online_ba: False # whether to enable online bundle adjustment

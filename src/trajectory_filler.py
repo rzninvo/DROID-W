@@ -83,7 +83,9 @@ class PoseTrajectoryFiller:
             w1 = (1 - ((ts[t1] - tt) / dt)).view(-1, 1, 1)
             self.video.uncertainties[N:N+M] = w0 * self.video.uncertainties[t0] + w1 * self.video.uncertainties[t1]
 
-        graph = FactorGraph(self.video, self.update)
+        # use_stability=False: the staged non-keyframe slots [N, N+M) carry no DINO
+        # features, so the temporal-stability kernel must not run on this graph
+        graph = FactorGraph(self.video, self.update, use_stability=False)
         # build edge between current frame and nearby keyframes for optimization
         graph.add_factors(t0.cuda(), torch.arange(N, N+M).cuda())
         graph.add_factors(t1.cuda(), torch.arange(N, N+M).cuda())

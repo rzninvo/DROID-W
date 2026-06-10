@@ -1,0 +1,8 @@
+# HERMES variant run: walking_xyz with the temporal-stability ARK enabled.
+# Everything else identical to the canonical freiburg3_walking_xyz baseline.
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_xyz.yaml
+scene: freiburg3_walking_xyz_stab
+
+tracking:
+  stability:
+    enable: True

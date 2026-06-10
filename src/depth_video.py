@@ -104,6 +104,14 @@ class DepthVideo:
             self.dino_feats = None
             self.dino_feats_resize = None
 
+        # HERMES variant: per-keyframe temporal stability S(u) buffer
+        # (RADIO-ViPE ARK port, see src/utils/dyn_uncertainty/temporal_stability.py)
+        self.stability_enabled = cfg['tracking']['stability']['enable']
+        if self.stability_enabled:
+            self.stability = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+        else:
+            self.stability = None
+
     def get_lock(self):
         return self.counter.get_lock()
 
@@ -804,6 +812,10 @@ class DepthVideo:
         droid_disps = self.disps[:self.counter.value].cpu().numpy()
         intrinsics = self.intrinsics[:self.counter.value].cpu().numpy()
         uncertainties = self.uncertainties[:self.counter.value].cpu().numpy()
+        # HERMES variant: export per-keyframe temporal stability S(u) when enabled
+        extra = {}
+        if self.stability_enabled:
+            extra['stability'] = self.stability[:self.counter.value].cpu().numpy()
         np.savez(path,
             timestamps=timestamps,
             images=images,
@@ -812,7 +824,8 @@ class DepthVideo:
             droid_disps_up=droid_disps_up,
             droid_disps=droid_disps,
             intrinsics=intrinsics,
-            uncertainties=uncertainties)
+            uncertainties=uncertainties,
+            **extra)
         self.printer.print(f"Saved final depth video: {path}",FontColor.INFO)
 
     def save_poses(self,path:str):
