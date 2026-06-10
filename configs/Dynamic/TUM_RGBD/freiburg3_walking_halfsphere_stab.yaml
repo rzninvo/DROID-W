@@ -1,0 +1,8 @@
+# HERMES variant run: walking_halfsphere with the temporal-stability ARK enabled.
+# Everything else identical to the canonical freiburg3_walking_halfsphere baseline.
+inherit_from: ./configs/Dynamic/TUM_RGBD/freiburg3_walking_halfsphere.yaml
+scene: freiburg3_walking_halfsphere_stab
+
+tracking:
+  stability:
+    enable: True
