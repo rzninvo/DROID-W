@@ -1,5 +1,5 @@
 # HERMES variant run: Replica room0 static control with temporal-stability ARK.
-inherit_from: ./configs/room0_estpose_estpose.yaml
+inherit_from: ./configs/room0_estpose.yaml
 scene: room0_estpose_stab
 
 tracking:

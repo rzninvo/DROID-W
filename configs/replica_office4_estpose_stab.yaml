@@ -1,5 +1,5 @@
 # HERMES variant run: Replica office4 static control with temporal-stability ARK.
-inherit_from: ./configs/office4_estpose_estpose.yaml
+inherit_from: ./configs/office4_estpose.yaml
 scene: office4_estpose_stab
 
 tracking:
