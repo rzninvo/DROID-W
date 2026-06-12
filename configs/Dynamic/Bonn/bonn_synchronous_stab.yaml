@@ -1,0 +1,9 @@
+# HERMES variant run: Bonn synchronous (two people moving synchronously) with
+# the temporal-stability ARK enabled. Everything else identical to the
+# canonical bonn_synchronous baseline.
+inherit_from: ./configs/Dynamic/Bonn/bonn_synchronous.yaml
+scene: bonn_synchronous_stab
+
+tracking:
+  stability:
+    enable: True

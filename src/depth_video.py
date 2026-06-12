@@ -114,12 +114,16 @@ class DepthVideo:
         if self.stability_enabled:
             self.stability = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             self.motion = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self.romo_err = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self.romo_vbar = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
             self.flowdisc = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             self.flowmap = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             self.flowmag = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
         else:
             self.stability = None
             self.motion = None
+            self.romo_err = None
+            self.romo_vbar = None
             self.flowdisc = None
             self.flowmap = None
             self.flowmag = None
@@ -831,6 +835,8 @@ class DepthVideo:
         if self.stability_enabled:
             extra['stability'] = self.stability[:self.counter.value].cpu().numpy()
             extra['motion'] = self.motion[:self.counter.value].cpu().numpy()
+            extra['romo_err'] = self.romo_err[:self.counter.value].cpu().numpy()
+            extra['romo_vbar'] = self.romo_vbar[:self.counter.value].cpu().numpy()
             extra['flowdisc'] = self.flowdisc[:self.counter.value].cpu().numpy()
             extra['flowmap'] = self.flowmap[:self.counter.value].cpu().numpy()
             extra['flowmag'] = self.flowmag[:self.counter.value].cpu().numpy()

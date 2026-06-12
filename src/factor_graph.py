@@ -223,6 +223,8 @@ class FactorGraph:
             if self.video.stability_enabled:
                 self.video.stability[ix] = self.video.stability[ix+1]
                 self.video.motion[ix] = self.video.motion[ix+1]
+                self.video.romo_err[ix] = self.video.romo_err[ix+1]
+                self.video.romo_vbar[ix] = self.video.romo_vbar[ix+1]
                 self.video.flowdisc[ix] = self.video.flowdisc[ix+1]
                 self.video.flowmap[ix] = self.video.flowmap[ix+1]
                 self.video.flowmag[ix] = self.video.flowmag[ix+1]
