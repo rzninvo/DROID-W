@@ -49,7 +49,10 @@ def epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w):
       RANSAC-LMEDS fit on flow (romo.py:357-359) — BA-grade geometry replaces
       robust estimation. The consumer applies their thresholds verbatim:
       dynamic err > max(2*vbar, 0.5), static err <= min(vbar/100, 0.01)
-      (romo.py:421,430), vbar = mean L2 of the normalized flow (romo.py:322).
+      (romo.py:421,430), vbar = mean L2 of the PIXEL flow (romo.py:322-328
+      averages raw flow_fwd/flow_bwd magnitudes). err is px^2-scale (fac^2),
+      so the px-scale vbar is the correct comparand; a normalized-flow vbar
+      was ~fac too small and over-fired (fixed).
       Ill-conditioned edges (near-pure-rotation: line strength below the
       global median) contribute no evidence — our guard; their LMEDS fit
       degrades gracefully there instead.
@@ -125,7 +128,12 @@ def epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w):
         z = (h2 * d1).sum(-1)
         sden = d1[..., 0] ** 2 + d1[..., 1] ** 2 + d2[..., 0] ** 2 + d2[..., 1] ** 2
         romo[c0:c1] = (z ** 2 / sden.clamp_min(1e-12)) * fac ** 2       # err*fac^2
-        vbar_edge[c0:c1] = fl_n.norm(dim=-1).mean(dim=-1)               # romo.py:322
+        # vbar = mean L2 of the PIXEL flow (romo.py:322-328 averages the raw
+        # flow_fwd/flow_bwd magnitudes, NOT the normalized flow). err above is
+        # pixel^2 (z^2/sden is normalized^2, x fac^2 -> pixel^2), so the RoMo
+        # thresholds 2*vbar / vbar/100 must compare against a PIXEL vbar — the
+        # prior fl_n (normalized) vbar was ~fac too small and over-fired.
+        vbar_edge[c0:c1] = flow_px.norm(dim=-1).mean(dim=-1)            # romo.py:322
 
         # flow discrepancy: pixels whose reprojection is invalid (behind /
         # too close to the camera, projective_ops MIN_DEPTH) carry no evidence
