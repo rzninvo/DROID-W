@@ -35,18 +35,31 @@ CHUNK = 16  # edges per chunk when gathering/sampling feature maps (bounds peak 
 
 
 @torch.no_grad()
-def epipolar_motion_residual(video, ii, jj, target, h, w):
-    """Per-keyframe epipolar motion evidence M_i(u), RoMo-style but training-free.
+def epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w):
+    """Per-keyframe motion evidence fields, training-free.
 
-    Motion is, geometrically, a violation of rigid camera geometry: the distance
-    of the GRU-predicted correspondence (target) from the epipolar line induced
-    by the BA relative pose (RoMo, arXiv:2411.18650, uses Sampson distance vs a
-    RANSAC fundamental matrix; we have BA-grade relative poses). Depth-free —
-    unlike the full reprojection residual it cannot be confused by depth error.
-    Pixels where the epipolar line is ill-conditioned (near-pure-rotation edges:
-    line normal below the global median strength) contribute no evidence.
-    Returns per-source-frame median maps plus the per-frame median flow
-    magnitude (RoMo's scale-free normalizer).
+    Two complementary geometric channels per source keyframe:
+    - M_i(u), epipolar: distance of the GRU-predicted correspondence (target)
+      from the epipolar line induced by the BA relative pose (RoMo,
+      arXiv:2411.18650, uses Sampson distance vs a RANSAC fundamental matrix;
+      we have BA-grade relative poses). Depth-free — unlike the reprojection
+      residual it cannot be confused by depth error — but blind to motion
+      within the epipolar plane (along the line / toward the camera).
+      Pixels where the epipolar line is ill-conditioned (near-pure-rotation
+      edges: line normal below the global median strength) contribute no
+      evidence.
+    - D_i(u), flow discrepancy: ||target - coords||, the GRU correspondence vs
+      the camera-induced correspondence reprojected from BA depth + pose
+      (MonST3R, arXiv:2410.03825, Eq. 3: dynamics = mismatch between
+      camera-induced flow and observed flow). Depth moves the reprojection
+      along the epipolar line only, so this channel sees exactly the motion
+      M(u) is blind to; in exchange it can be inflated by depth error, so the
+      consumer must corroborate it (mask_stability_classifier seeds on it only
+      jointly with low feature stability).
+    Returns per-source-frame median maps for both, the per-pixel flow-magnitude
+    map (median |target - grid| over edges; lets the consumer re-normalize on
+    static-only pixels, RoMo's iterative refinement), and the per-frame median
+    flow magnitude (RoMo's scale-free normalizer, kept for compatibility).
     """
     device = target.device
     N = ii.shape[0]
@@ -70,6 +83,8 @@ def epipolar_motion_residual(video, ii, jj, target, h, w):
 
     epi = torch.zeros(N, h * w, device=device)
     den_all = torch.zeros(N, h * w, device=device)
+    disc = torch.zeros(N, h * w, device=device)
+    fmag = torch.zeros(N, h * w, device=device)
     flow0 = torch.stack([gx, gy], -1)                                   # (h,w,2)
     flowmag_edge = torch.zeros(N, device=device)
     for c0 in range(0, N, CHUNK):
@@ -81,20 +96,29 @@ def epipolar_motion_residual(video, ii, jj, target, h, w):
         den = lines[:, :2].norm(dim=1)
         epi[c0:c1] = num / den.clamp_min(1e-8)
         den_all[c0:c1] = den
-        flowmag_edge[c0:c1] = (target[0, c0:c1] - flow0).norm(dim=-1).median(dim=-1)[0].median(dim=-1)[0]
+        # flow discrepancy: pixels whose reprojection is invalid (behind /
+        # too close to the camera, projective_ops MIN_DEPTH) carry no evidence
+        d = (target[0, c0:c1] - coords[0, c0:c1]).norm(dim=-1).reshape(c1 - c0, h * w)
+        v = valid[0, c0:c1, ..., 0].reshape(c1 - c0, h * w)
+        disc[c0:c1] = torch.where(v > 0.5, d, torch.full_like(d, float("nan")))
+        fmag[c0:c1] = (target[0, c0:c1] - flow0).norm(dim=-1).reshape(c1 - c0, h * w)
+        flowmag_edge[c0:c1] = fmag[c0:c1].median(dim=-1)[0]
 
     # conditioning guard: only pixels whose epipolar line strength is above the
     # global median carry evidence (self-referential, no constants)
     cond = den_all > den_all.median()
     epi = torch.where(cond, epi, torch.full_like(epi, float("nan")))
 
-    M_fields, flow_fields = {}, {}
+    M_fields, D_fields, flowmap_fields, flow_fields = {}, {}, {}, {}
     for f in torch.unique(ii):
         sel = ii == f
         m = torch.nanmedian(epi[sel], dim=0)[0]
         M_fields[int(f)] = torch.nan_to_num(m, nan=0.0).reshape(h, w)
+        d = torch.nanmedian(disc[sel], dim=0)[0]
+        D_fields[int(f)] = torch.nan_to_num(d, nan=0.0).reshape(h, w)
+        flowmap_fields[int(f)] = fmag[sel].median(dim=0)[0].reshape(h, w)
         flow_fields[int(f)] = float(flowmag_edge[sel].median())
-    return M_fields, flow_fields
+    return M_fields, D_fields, flowmap_fields, flow_fields
 
 
 def barron_irls_sqrt_weight(r: torch.Tensor, alpha: torch.Tensor, c: float = 1.0) -> torch.Tensor:
@@ -183,10 +207,14 @@ def modulate_weight(video, ii: torch.Tensor, jj: torch.Tensor,
         S_fields[fidx] = S
         video.stability[fidx] = S
 
-    # ---- epipolar motion evidence export (RoMo-style, training-free) ----
-    M_fields, flow_fields = epipolar_motion_residual(video, ii, jj, target, h, w)
+    # ---- motion evidence export (epipolar: RoMo-style; flow discrepancy:
+    # MonST3R Eq. 3 computed from BA depth+pose vs the GRU correspondence) ----
+    M_fields, D_fields, flowmap_fields, flow_fields = \
+        epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w)
     for fidx, M in M_fields.items():
         video.motion[fidx] = M
+        video.flowdisc[fidx] = D_fields[fidx]
+        video.flowmap[fidx] = flowmap_fields[fidx]
         video.flowmag[fidx] = flow_fields[fidx]
 
     # ---- per-edge alpha from min(S_i, S_j) (terms.py:578-612) ----
