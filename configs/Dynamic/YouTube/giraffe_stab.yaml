@@ -1,0 +1,7 @@
+# HERMES variant run: giraffe (in-the-wild YouTube, running animals) with ARK.
+inherit_from: ./configs/Dynamic/YouTube/giraffe.yaml
+scene: giraffe_stab
+
+tracking:
+  stability:
+    enable: True
