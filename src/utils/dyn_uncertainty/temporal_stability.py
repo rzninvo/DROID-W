@@ -27,10 +27,74 @@ Gated by cfg['tracking']['stability']['enable']; False = canonical DROID-W,
 bit-identical (this module is never called).
 """
 
+import lietorch
 import torch
 import torch.nn.functional as F
 
 CHUNK = 16  # edges per chunk when gathering/sampling feature maps (bounds peak memory)
+
+
+@torch.no_grad()
+def epipolar_motion_residual(video, ii, jj, target, h, w):
+    """Per-keyframe epipolar motion evidence M_i(u), RoMo-style but training-free.
+
+    Motion is, geometrically, a violation of rigid camera geometry: the distance
+    of the GRU-predicted correspondence (target) from the epipolar line induced
+    by the BA relative pose (RoMo, arXiv:2411.18650, uses Sampson distance vs a
+    RANSAC fundamental matrix; we have BA-grade relative poses). Depth-free —
+    unlike the full reprojection residual it cannot be confused by depth error.
+    Pixels where the epipolar line is ill-conditioned (near-pure-rotation edges:
+    line normal below the global median strength) contribute no evidence.
+    Returns per-source-frame median maps plus the per-frame median flow
+    magnitude (RoMo's scale-free normalizer).
+    """
+    device = target.device
+    N = ii.shape[0]
+    intr = video.intrinsics[0]
+    fx, fy, cx, cy = (float(intr[0]), float(intr[1]), float(intr[2]), float(intr[3]))
+    K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], device=device)
+    Kinv = torch.linalg.inv(K)
+    Gs = lietorch.SE3(video.poses[None])
+    Gij = (Gs[:, jj] * Gs[:, ii].inv()).matrix()[0]   # (N,4,4): x_j = R x_i + t
+    Rrel, trel = Gij[:, :3, :3], Gij[:, :3, 3]
+    tx = torch.zeros(N, 3, 3, device=device)
+    tx[:, 0, 1], tx[:, 0, 2] = -trel[:, 2], trel[:, 1]
+    tx[:, 1, 0], tx[:, 1, 2] = trel[:, 2], -trel[:, 0]
+    tx[:, 2, 0], tx[:, 2, 1] = -trel[:, 1], trel[:, 0]
+    Fm = Kinv.T @ (tx @ Rrel) @ Kinv                  # (N,3,3)
+
+    gy, gx = torch.meshgrid(torch.arange(h, device=device, dtype=torch.float32),
+                            torch.arange(w, device=device, dtype=torch.float32),
+                            indexing="ij")
+    Xs = torch.stack([gx, gy, torch.ones_like(gx)], 0).reshape(3, -1)  # (3, h*w)
+
+    epi = torch.zeros(N, h * w, device=device)
+    den_all = torch.zeros(N, h * w, device=device)
+    flow0 = torch.stack([gx, gy], -1)                                   # (h,w,2)
+    flowmag_edge = torch.zeros(N, device=device)
+    for c0 in range(0, N, CHUNK):
+        c1 = min(c0 + CHUNK, N)
+        lines = Fm[c0:c1] @ Xs                                          # (n,3,h*w)
+        tgt = target[0, c0:c1].reshape(c1 - c0, h * w, 2).permute(0, 2, 1)
+        Xt = torch.cat([tgt, torch.ones(c1 - c0, 1, h * w, device=device)], 1)
+        num = (Xt * lines).sum(1).abs()
+        den = lines[:, :2].norm(dim=1)
+        epi[c0:c1] = num / den.clamp_min(1e-8)
+        den_all[c0:c1] = den
+        flowmag_edge[c0:c1] = (target[0, c0:c1] - flow0).norm(dim=-1).median(dim=-1)[0].median(dim=-1)[0]
+
+    # conditioning guard: only pixels whose epipolar line strength is above the
+    # global median carry evidence (self-referential, no constants)
+    cond = den_all > den_all.median()
+    epi = torch.where(cond, epi, torch.full_like(epi, float("nan")))
+
+    M_fields, flow_fields = {}, {}
+    for f in torch.unique(ii):
+        sel = ii == f
+        m = torch.nanmedian(epi[sel], dim=0)[0]
+        M_fields[int(f)] = torch.nan_to_num(m, nan=0.0).reshape(h, w)
+        flow_fields[int(f)] = float(flowmag_edge[sel].median())
+    return M_fields, flow_fields
 
 
 def barron_irls_sqrt_weight(r: torch.Tensor, alpha: torch.Tensor, c: float = 1.0) -> torch.Tensor:
@@ -118,6 +182,12 @@ def modulate_weight(video, ii: torch.Tensor, jj: torch.Tensor,
         fidx = int(f)
         S_fields[fidx] = S
         video.stability[fidx] = S
+
+    # ---- epipolar motion evidence export (RoMo-style, training-free) ----
+    M_fields, flow_fields = epipolar_motion_residual(video, ii, jj, target, h, w)
+    for fidx, M in M_fields.items():
+        video.motion[fidx] = M
+        video.flowmag[fidx] = flow_fields[fidx]
 
     # ---- per-edge alpha from min(S_i, S_j) (terms.py:578-612) ----
     S_DEFAULT = 0.5  # neutral: frames never appearing as a source

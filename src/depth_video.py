@@ -106,11 +106,16 @@ class DepthVideo:
 
         # HERMES variant: per-keyframe temporal stability S(u) buffer
         # (RADIO-ViPE ARK port, see src/utils/dyn_uncertainty/temporal_stability.py)
+        # plus the epipolar motion-evidence buffers (RoMo-style, training-free)
         self.stability_enabled = cfg['tracking']['stability']['enable']
         if self.stability_enabled:
             self.stability = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self.motion = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self.flowmag = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
         else:
             self.stability = None
+            self.motion = None
+            self.flowmag = None
 
     def get_lock(self):
         return self.counter.get_lock()
@@ -812,10 +817,13 @@ class DepthVideo:
         droid_disps = self.disps[:self.counter.value].cpu().numpy()
         intrinsics = self.intrinsics[:self.counter.value].cpu().numpy()
         uncertainties = self.uncertainties[:self.counter.value].cpu().numpy()
-        # HERMES variant: export per-keyframe temporal stability S(u) when enabled
+        # HERMES variant: export per-keyframe temporal stability S(u), epipolar
+        # motion evidence M(u) and per-keyframe flow magnitude when enabled
         extra = {}
         if self.stability_enabled:
             extra['stability'] = self.stability[:self.counter.value].cpu().numpy()
+            extra['motion'] = self.motion[:self.counter.value].cpu().numpy()
+            extra['flowmag'] = self.flowmag[:self.counter.value].cpu().numpy()
         np.savez(path,
             timestamps=timestamps,
             images=images,

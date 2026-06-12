@@ -222,6 +222,8 @@ class FactorGraph:
                 self.video.uncertainties[ix] = self.video.uncertainties[ix+1]
             if self.video.stability_enabled:
                 self.video.stability[ix] = self.video.stability[ix+1]
+                self.video.motion[ix] = self.video.motion[ix+1]
+                self.video.flowmag[ix] = self.video.flowmag[ix+1]
 
         m = (self.ii_inac == ix) | (self.jj_inac == ix)
         self.ii_inac[self.ii_inac >= ix] -= 1       # kfs after ix: index - 1
