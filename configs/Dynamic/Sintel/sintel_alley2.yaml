@@ -1,0 +1,34 @@
+# MPI Sintel alley_2 (ParticleSFM 14-seq motion-mask protocol; final pass).
+# Frame-dir ingestion via the RGB_NoPose loader (dataset kind 'youtube' globs
+# rgb/frame*.png). Intrinsics parsed from training/camdata_left/alley_2
+# (Sintel SDK cam_read): fx=fy=576, cx=511.5, cy=217.5 @ 1024x436.
+inherit_from: ./configs/droid_w.yaml
+
+dataset: 'youtube'
+scene: sintel_alley2
+
+data:
+  root_folder: ./datasets/Sintel
+  output: ./Outputs/Sintel
+  input_folder: ./datasets/Sintel/alley_2
+
+cam:
+  png_depth_scale: 1.0
+  H: 436
+  W: 1024
+  fx: 576.0
+  fy: 576.0
+  cx: 511.5
+  cy: 217.5
+  distortion: [0, 0, 0, 0, 0]
+  H_out: 216
+  W_out: 512
+
+# Sintel sequences are 50 frames; with the droid_w defaults (warmup=12 kf,
+# force-keyframe every 9) the whole clip yields ~8 keyframes and the evidence
+# stage never passes warmup (S/M/D stay zero). Dataset-level ingestion
+# accommodation, uniform across all 14 protocol sequences — not per-scene
+# tuning: denser keyframes + minimal bootstrap.
+tracking:
+  warmup: 4
+  force_keyframe_every_n_frames: 2

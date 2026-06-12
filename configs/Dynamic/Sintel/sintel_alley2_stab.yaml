@@ -1,0 +1,8 @@
+# HERMES variant run: Sintel alley_2 with the temporal-stability ARK enabled.
+# Everything else identical to the canonical sintel_alley2 baseline.
+inherit_from: ./configs/Dynamic/Sintel/sintel_alley2.yaml
+scene: sintel_alley2_stab
+
+tracking:
+  stability:
+    enable: True
