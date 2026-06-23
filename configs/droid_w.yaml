@@ -92,9 +92,11 @@ tracking:
     thresh: 0.01    # eta in eq(6) of the paper
     visible_num: 2  # points need to be viewed by at least X cameras
   stability:        # HERMES variant: temporal-stability adaptive robust kernel
-                    # (RADIO-ViPE/KM-ViPE port, arXiv:2604.26067 Eqs. 8-11);
-                    # enable=False keeps tracking bit-identical to canonical DROID-W.
-    enable: False
+                    # (RADIO-ViPE/KM-ViPE port, arXiv:2604.26067 Eqs. 8-11).
+                    # Default-ON: produces S(u), the PRIMARY dynamic-detection cue
+                    # (mask_stability_classifier.py). ARK is ATE-neutral; set
+                    # enable=False to recover bit-identical canonical DROID-W.
+    enable: True
     thresh_static: 0.75   # S >= th_s -> alpha_static (L2); reference defaults
     thresh_movable: 0.35  # S < th_m -> alpha_dynamic
     alpha_static: 2.0
