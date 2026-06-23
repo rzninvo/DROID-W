@@ -27,145 +27,10 @@ Gated by cfg['tracking']['stability']['enable']; False = canonical DROID-W,
 bit-identical (this module is never called).
 """
 
-import lietorch
 import torch
 import torch.nn.functional as F
 
 CHUNK = 16  # edges per chunk when gathering/sampling feature maps (bounds peak memory)
-
-
-@torch.no_grad()
-def epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w):
-    """Per-keyframe motion evidence fields, training-free.
-
-    Geometric channels per source keyframe:
-    - R_i(u), RoMo error (VERBATIM port of google-deepmind/romo, audited
-      2026-06-12): squared Sampson error of the GRU correspondence against the
-      fundamental matrix, computed in their exact normalized coordinates
-      (grid: 2*(x+0.5)/dim - 1, flow: 2*dx/(dim-1), romo.py:337-345), scaled
-      by fac^2 with fac=(H+W)/2 of the working grid (romo.py:372-373,404-405),
-      max-combined over edges (their fwd/bwd amax, romo.py:418). Our working
-      grid is the BA grid; our F comes from BA relative poses instead of their
-      RANSAC-LMEDS fit on flow (romo.py:357-359) — BA-grade geometry replaces
-      robust estimation. The consumer applies their thresholds verbatim:
-      dynamic err > max(2*vbar, 0.5), static err <= min(vbar/100, 0.01)
-      (romo.py:421,430), vbar = mean L2 of the PIXEL flow (romo.py:322-328
-      averages raw flow_fwd/flow_bwd magnitudes). err is px^2-scale (fac^2),
-      so the px-scale vbar is the correct comparand; a normalized-flow vbar
-      was ~fac too small and over-fired (fixed).
-      Ill-conditioned edges (near-pure-rotation: line strength below the
-      global median) contribute no evidence — our guard; their LMEDS fit
-      degrades gracefully there instead.
-    - M_i(u), legacy epipolar line distance (kept for ablation/back-compat).
-    - D_i(u), flow discrepancy: ||target - coords||, the GRU correspondence vs
-      the camera-induced correspondence reprojected from BA depth + pose
-      (MonST3R, arXiv:2410.03825, Eq. 3). Evidence-only export.
-    Returns per-source-frame maps (romo amax map + vbar scalar; legacy median
-    maps; flow-magnitude map and scalar for the excision re-normalization).
-    """
-    device = target.device
-    N = ii.shape[0]
-    intr = video.intrinsics[0]
-    fx, fy, cx, cy = (float(intr[0]), float(intr[1]), float(intr[2]), float(intr[3]))
-    K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], device=device)
-    Kinv = torch.linalg.inv(K)
-    Gs = lietorch.SE3(video.poses[None])
-    Gij = (Gs[:, jj] * Gs[:, ii].inv()).matrix()[0]   # (N,4,4): x_j = R x_i + t
-    Rrel, trel = Gij[:, :3, :3], Gij[:, :3, 3]
-    tx = torch.zeros(N, 3, 3, device=device)
-    tx[:, 0, 1], tx[:, 0, 2] = -trel[:, 2], trel[:, 1]
-    tx[:, 1, 0], tx[:, 1, 2] = trel[:, 2], -trel[:, 0]
-    tx[:, 2, 0], tx[:, 2, 1] = -trel[:, 1], trel[:, 0]
-    Fm = Kinv.T @ (tx @ Rrel) @ Kinv                  # (N,3,3)
-
-    gy, gx = torch.meshgrid(torch.arange(h, device=device, dtype=torch.float32),
-                            torch.arange(w, device=device, dtype=torch.float32),
-                            indexing="ij")
-    Xs = torch.stack([gx, gy, torch.ones_like(gx)], 0).reshape(3, -1)  # (3, h*w)
-
-    # romo.py:337-345 normalized coordinates on the working grid:
-    #   grid:  x_n = 2*(x + 0.5)/dim - 1   (note: dim, with +0.5 offset)
-    #   flow:  dx_n = 2*dx/(dim - 1)       (note: dim-1, no offset)
-    # F transported to those coordinates: x_n = A x_px (homogeneous affine),
-    # F_n = A^-T F A^-1.
-    A = torch.tensor([[2.0 / w, 0.0, 1.0 / w - 1.0],
-                      [0.0, 2.0 / h, 1.0 / h - 1.0],
-                      [0.0, 0.0, 1.0]], device=device)
-    Ainv = torch.linalg.inv(A)
-    Fn = Ainv.T @ Fm @ Ainv                                             # (N,3,3)
-    fac = (h + w) / 2.0                                                 # romo.py:372
-    gxn = 2.0 * (gx + 0.5) / w - 1.0
-    gyn = 2.0 * (gy + 0.5) / h - 1.0
-    X1n = torch.stack([gxn, gyn, torch.ones_like(gxn)], 0).reshape(3, -1)
-
-    epi = torch.zeros(N, h * w, device=device)
-    den_all = torch.zeros(N, h * w, device=device)
-    romo = torch.zeros(N, h * w, device=device)
-    vbar_edge = torch.zeros(N, device=device)
-    disc = torch.zeros(N, h * w, device=device)
-    fmag = torch.zeros(N, h * w, device=device)
-    flow0 = torch.stack([gx, gy], -1)                                   # (h,w,2)
-    flowmag_edge = torch.zeros(N, device=device)
-    for c0 in range(0, N, CHUNK):
-        c1 = min(c0 + CHUNK, N)
-        n = c1 - c0
-        lines = Fm[c0:c1] @ Xs                                          # (n,3,h*w)
-        tgt = target[0, c0:c1].reshape(n, h * w, 2).permute(0, 2, 1)
-        Xt = torch.cat([tgt, torch.ones(n, 1, h * w, device=device)], 1)
-        num = (Xt * lines).sum(1).abs()
-        den = lines[:, :2].norm(dim=1)
-        epi[c0:c1] = num / den.clamp_min(1e-8)
-        den_all[c0:c1] = den
-
-        # ---- RoMo squared Sampson in normalized coords (romo.py:273-283) ----
-        flow_px = (target[0, c0:c1] - flow0).reshape(n, h * w, 2)       # (n,hw,2)
-        fl_n = torch.stack([2.0 * flow_px[..., 0] / (w - 1),
-                            2.0 * flow_px[..., 1] / (h - 1)], -1)
-        X2n = X1n[None, :2].permute(0, 2, 1) + fl_n                     # (n,hw,2)
-        h2 = torch.cat([X2n, torch.ones(n, h * w, 1, device=device)], -1)
-        d1 = (Fn[c0:c1] @ X1n).permute(0, 2, 1)                         # F x1
-        d2 = h2 @ Fn[c0:c1]                                             # F^T x2
-        z = (h2 * d1).sum(-1)
-        sden = d1[..., 0] ** 2 + d1[..., 1] ** 2 + d2[..., 0] ** 2 + d2[..., 1] ** 2
-        romo[c0:c1] = (z ** 2 / sden.clamp_min(1e-12)) * fac ** 2       # err*fac^2
-        # vbar = mean L2 of the PIXEL flow (romo.py:322-328 averages the raw
-        # flow_fwd/flow_bwd magnitudes, NOT the normalized flow). err above is
-        # pixel^2 (z^2/sden is normalized^2, x fac^2 -> pixel^2), so the RoMo
-        # thresholds 2*vbar / vbar/100 must compare against a PIXEL vbar — the
-        # prior fl_n (normalized) vbar was ~fac too small and over-fired.
-        vbar_edge[c0:c1] = flow_px.norm(dim=-1).mean(dim=-1)            # romo.py:322
-
-        # flow discrepancy: pixels whose reprojection is invalid (behind /
-        # too close to the camera, projective_ops MIN_DEPTH) carry no evidence
-        d = (target[0, c0:c1] - coords[0, c0:c1]).norm(dim=-1).reshape(n, h * w)
-        v = valid[0, c0:c1, ..., 0].reshape(n, h * w)
-        disc[c0:c1] = torch.where(v > 0.5, d, torch.full_like(d, float("nan")))
-        fmag[c0:c1] = flow_px.norm(dim=-1)
-        flowmag_edge[c0:c1] = fmag[c0:c1].median(dim=-1)[0]
-
-    # conditioning guard: only pixels whose epipolar line strength is above the
-    # global median carry evidence (self-referential, no constants)
-    cond = den_all > den_all.median()
-    epi = torch.where(cond, epi, torch.full_like(epi, float("nan")))
-    romo_g = torch.where(cond, romo, torch.full_like(romo, float("-inf")))
-
-    M_fields, R_fields, vbar_fields = {}, {}, {}
-    D_fields, flowmap_fields, flow_fields = {}, {}, {}
-    for f in torch.unique(ii):
-        sel = ii == f
-        m = torch.nanmedian(epi[sel], dim=0)[0]
-        M_fields[int(f)] = torch.nan_to_num(m, nan=0.0).reshape(h, w)
-        # romo amax over the frame's edges (their fwd/bwd amax, romo.py:418);
-        # pixels with no conditioned edge carry zero evidence
-        r = romo_g[sel].amax(dim=0)
-        R_fields[int(f)] = torch.where(torch.isfinite(r), r,
-                                       torch.zeros_like(r)).reshape(h, w)
-        vbar_fields[int(f)] = float(vbar_edge[sel].mean())              # avg of edge means
-        d = torch.nanmedian(disc[sel], dim=0)[0]
-        D_fields[int(f)] = torch.nan_to_num(d, nan=0.0).reshape(h, w)
-        flowmap_fields[int(f)] = fmag[sel].median(dim=0)[0].reshape(h, w)
-        flow_fields[int(f)] = float(flowmag_edge[sel].median())
-    return M_fields, R_fields, vbar_fields, D_fields, flowmap_fields, flow_fields
 
 
 def barron_irls_sqrt_weight(r: torch.Tensor, alpha: torch.Tensor, c: float = 1.0) -> torch.Tensor:
@@ -253,18 +118,6 @@ def modulate_weight(video, ii: torch.Tensor, jj: torch.Tensor,
         fidx = int(f)
         S_fields[fidx] = S
         video.stability[fidx] = S
-
-    # ---- motion evidence export (RoMo verbatim Sampson + legacy epipolar;
-    # flow discrepancy: MonST3R Eq. 3 from BA depth+pose vs GRU flow) ----
-    M_fields, R_fields, vbar_fields, D_fields, flowmap_fields, flow_fields = \
-        epipolar_motion_residual(video, ii, jj, target, coords, valid, h, w)
-    for fidx, M in M_fields.items():
-        video.motion[fidx] = M
-        video.romo_err[fidx] = R_fields[fidx]
-        video.romo_vbar[fidx] = vbar_fields[fidx]
-        video.flowdisc[fidx] = D_fields[fidx]
-        video.flowmap[fidx] = flowmap_fields[fidx]
-        video.flowmag[fidx] = flow_fields[fidx]
 
     # ---- per-edge alpha from min(S_i, S_j) (terms.py:578-612) ----
     S_DEFAULT = 0.5  # neutral: frames never appearing as a source

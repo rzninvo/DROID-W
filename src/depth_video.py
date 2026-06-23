@@ -105,28 +105,12 @@ class DepthVideo:
             self.dino_feats_resize = None
 
         # HERMES variant: per-keyframe temporal stability S(u) buffer
-        # (RADIO-ViPE ARK port, see src/utils/dyn_uncertainty/temporal_stability.py)
-        # plus the motion-evidence buffers: epipolar (RoMo-style), flow
-        # discrepancy (MonST3R Eq. 3 from BA depth+pose), and the per-pixel
-        # flow-magnitude map (lets the offline classifier re-normalize on
-        # static-only pixels, RoMo's iterative refinement). All training-free.
+        # (RADIO-ViPE ARK port, see src/utils/dyn_uncertainty/temporal_stability.py).
         self.stability_enabled = cfg['tracking']['stability']['enable']
         if self.stability_enabled:
             self.stability = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            self.motion = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            self.romo_err = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            self.romo_vbar = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
-            self.flowdisc = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            self.flowmap = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            self.flowmag = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
         else:
             self.stability = None
-            self.motion = None
-            self.romo_err = None
-            self.romo_vbar = None
-            self.flowdisc = None
-            self.flowmap = None
-            self.flowmag = None
 
     def get_lock(self):
         return self.counter.get_lock()
@@ -828,18 +812,10 @@ class DepthVideo:
         droid_disps = self.disps[:self.counter.value].cpu().numpy()
         intrinsics = self.intrinsics[:self.counter.value].cpu().numpy()
         uncertainties = self.uncertainties[:self.counter.value].cpu().numpy()
-        # HERMES variant: export per-keyframe temporal stability S(u), epipolar
-        # motion evidence M(u), flow discrepancy D(u) (MonST3R Eq. 3), the
-        # per-pixel flow-magnitude map and per-keyframe flow magnitude when enabled
+        # HERMES variant: export per-keyframe temporal stability S(u) when enabled
         extra = {}
         if self.stability_enabled:
             extra['stability'] = self.stability[:self.counter.value].cpu().numpy()
-            extra['motion'] = self.motion[:self.counter.value].cpu().numpy()
-            extra['romo_err'] = self.romo_err[:self.counter.value].cpu().numpy()
-            extra['romo_vbar'] = self.romo_vbar[:self.counter.value].cpu().numpy()
-            extra['flowdisc'] = self.flowdisc[:self.counter.value].cpu().numpy()
-            extra['flowmap'] = self.flowmap[:self.counter.value].cpu().numpy()
-            extra['flowmag'] = self.flowmag[:self.counter.value].cpu().numpy()
         np.savez(path,
             timestamps=timestamps,
             images=images,
