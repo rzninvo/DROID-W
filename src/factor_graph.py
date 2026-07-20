@@ -208,6 +208,10 @@ class FactorGraph:
             # self.video.mono_disps_mask_up[ix] = self.video.mono_disps_mask_up[ix+1]
             self.video.valid_depth_mask[ix] = self.video.valid_depth_mask[ix+1]
             self.video.valid_depth_mask_small[ix] = self.video.valid_depth_mask_small[ix+1]
+            # vlm-mahbod: keep the dynamic-object BA masks aligned with their
+            # keyframes when a slot is removed (same shift as every buffer
+            # above); without this a stale mask sits on the wrong keyframe.
+            self.video.dyn_masks8[ix] = self.video.dyn_masks8[ix+1]
 
             self.video.nets[ix] = self.video.nets[ix+1]
             self.video.inps[ix] = self.video.inps[ix+1]
@@ -283,6 +287,14 @@ class FactorGraph:
             if self.stability_enabled and self.video.counter.value > self.video.cfg['tracking']['warmup']:
                 weight = modulate_weight(self.video, ii, jj, target, weight)
 
+            # vlm-mahbod: ViPE-style dynamic-object masking (ViPE paper 3.2.4;
+            # their factor_graph zeroes weight under the instance masks): zero
+            # the BA weight on flagged-dynamic pixels of each edge's SOURCE
+            # keyframe, so poses/depths are optimized on static content only.
+            # Opt-in via DROIDW_DYN_MASKS (see depth_video); default = no-op.
+            if self.video.dyn_mask_lookup is not None:
+                weight = weight * (1.0 - self.video.dyn_masks8[ii])[None, :, :, :, None]
+
             damping = .2 * self.damping[torch.unique(ii)].contiguous() + EP     # damping factor: avoid singlevalue tensor
 
             # bundle adjustment
@@ -345,6 +357,13 @@ class FactorGraph:
             # HERMES variant: temporal-stability ARK reweighting (enable=False = canonical)
             if self.stability_enabled and self.video.counter.value > self.video.cfg['tracking']['warmup']:
                 weight = modulate_weight(self.video, self.ii, self.jj, target, weight)
+
+            # vlm-mahbod: ViPE-style dynamic-object masking on the GLOBAL/low-mem
+            # BA path too (ViPE masks it at their factor_graph.py:373); without
+            # this the terminal dense_ba passes would re-admit dynamic pixels
+            # at full weight and undo the frontend masking.
+            if self.video.dyn_mask_lookup is not None:
+                weight = weight * (1.0 - self.video.dyn_masks8[self.ii])[None, :, :, :, None]
 
             # dense bundle adjustment
             self.video.ba(target, weight, damping, self.ii, self.jj, t0, t1,

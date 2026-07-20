@@ -63,7 +63,20 @@ class DepthVideo:
         self.depth_scale = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
         self.depth_shift = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
         self.valid_depth_mask = torch.zeros(buffer, ht, wd, device=self.device, dtype=torch.bool).share_memory_()
-        self.valid_depth_mask_small = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.bool).share_memory_()        
+        self.valid_depth_mask_small = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.bool).share_memory_()
+        ### vlm-mahbod: ViPE-style dynamic-object BA masking (ViPE paper 3.2.4:
+        ### static mask M multiplies the flow-network weight). Opt-in via env
+        ### DROIDW_DYN_MASKS=<npz>: keys = str(stream frame idx), values =
+        ### (H,W) uint8 dynamic-union masks (1 = movable object). Frames absent
+        ### from the npz fall back to the nearest masked frame within +-8, else
+        ### unmasked. Default (env unset) = zero masks = canonical behavior.
+        self.dyn_mask_lookup = None
+        self.dyn_masks8 = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+        _dm_path = os.environ.get('DROIDW_DYN_MASKS', '')
+        if _dm_path:
+            _dm_npz = np.load(_dm_path)
+            self.dyn_mask_lookup = {int(k): np.asarray(_dm_npz[k]) for k in _dm_npz.files}
+            print(f"[dyn-mask] loaded {len(self.dyn_mask_lookup)} frame masks from {_dm_path}")
         ### feature attributes ###
         self.fmaps = torch.zeros(buffer, 1, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
         self.nets = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
@@ -115,6 +128,37 @@ class DepthVideo:
     def get_lock(self):
         return self.counter.get_lock()
 
+    def _set_dyn_mask(self, index, tstamp):
+        """vlm-mahbod: store the (H,W) dynamic mask of stream frame `tstamp`
+        into the 1/8-grid buffer slot `index` (area-downsample, >0.3 -> 1).
+        Nearest masked frame within +-8 covers pass-2 keyframe drift; no match
+        -> unmasked (zeros) so behavior degrades to canonical, never breaks."""
+        m = self.dyn_mask_lookup.get(tstamp)
+        if m is None:
+            for d in range(1, 9):
+                if tstamp - d in self.dyn_mask_lookup:
+                    m = self.dyn_mask_lookup[tstamp - d]; break
+                if tstamp + d in self.dyn_mask_lookup:
+                    m = self.dyn_mask_lookup[tstamp + d]; break
+        if m is None:
+            self.dyn_masks8[index] = 0.0
+            return
+        mt = torch.from_numpy(m.astype(np.float32))[None, None].to(self.device)
+        # replicate the dataset transform (datasets.py get_color): resize the
+        # raw frame to (H_out+2*H_edge, W_out+2*W_edge) then crop the edges —
+        # otherwise the mask is scaled/shifted on edge-cropped configs (TUM
+        # uses H_edge=W_edge=8; Bonn uses 0, where this reduces to a resize).
+        _cam = self.cfg.get('cam', {}) if hasattr(self, 'cfg') else {}
+        _he = int(_cam.get('H_edge', 0) or 0)
+        _we = int(_cam.get('W_edge', 0) or 0)
+        mt = F.interpolate(mt, size=(self.ht + 2 * _he, self.wd + 2 * _we), mode='area')
+        if _he > 0:
+            mt = mt[:, :, _he:-_he, :]
+        if _we > 0:
+            mt = mt[:, :, :, _we:-_we]
+        m8 = F.interpolate(mt, size=(self.ht // self.down_scale, self.wd // self.down_scale), mode='area')[0, 0]
+        self.dyn_masks8[index] = (m8 > 0.3).float()
+
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
             self.counter.value = index + 1
@@ -124,6 +168,29 @@ class DepthVideo:
 
         self.timestamp[index] = item[0]
         self.images[index] = item[1].cpu()
+
+        # vlm-mahbod: attach the frame's dynamic mask (by stream index) at
+        # insertion so BA sees it wherever this keyframe lands in the buffer.
+        # index may be int, Tensor, slice, or list (trajectory_filler uses
+        # slices); normalize both index and timestamps to flat lists.
+        if self.dyn_mask_lookup is not None:
+            _ts_arr = torch.as_tensor(item[0]).reshape(-1)
+            if isinstance(index, torch.Tensor):
+                _idx_arr = index.reshape(-1).tolist()
+            elif isinstance(index, slice):
+                _idx_arr = list(range(*index.indices(self.dyn_masks8.shape[0])))
+            elif isinstance(index, (list, tuple)):
+                _idx_arr = [int(v) for v in index]
+            else:
+                _idx_arr = [int(index)]
+            if _ts_arr.numel() == 1 and len(_idx_arr) > 1:
+                _ts_arr = _ts_arr.repeat(len(_idx_arr))
+            if _ts_arr.numel() == len(_idx_arr):
+                for _bi, _tv in zip(_idx_arr, _ts_arr.tolist()):
+                    self._set_dyn_mask(int(_bi), int(_tv))
+            else:
+                print(f"[WARN] dyn-mask: index/timestamp count mismatch "
+                      f"({len(_idx_arr)} vs {_ts_arr.numel()}), fallback=skip attach")
 
         if item[2] is not None:
             self.poses[index] = item[2]
