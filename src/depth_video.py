@@ -130,7 +130,8 @@ class DepthVideo:
 
     def _set_dyn_mask(self, index, tstamp):
         """vlm-mahbod: store the (H,W) dynamic mask of stream frame `tstamp`
-        into the 1/8-grid buffer slot `index` (area-downsample, >0.3 -> 1).
+        into the 1/8-grid buffer slot `index` (ViPE report 3.6: BILINEAR
+        downsample of the keep-field, keep >= 0.9 <=> dynamic > 0.1 -> 1).
         Nearest masked frame within +-8 covers pass-2 keyframe drift; no match
         -> unmasked (zeros) so behavior degrades to canonical, never breaks."""
         m = self.dyn_mask_lookup.get(tstamp)
@@ -156,8 +157,11 @@ class DepthVideo:
             mt = mt[:, :, _he:-_he, :]
         if _we > 0:
             mt = mt[:, :, :, _we:-_we]
-        m8 = F.interpolate(mt, size=(self.ht // self.down_scale, self.wd // self.down_scale), mode='area')[0, 0]
-        self.dyn_masks8[index] = (m8 > 0.3).float()
+        # ViPE report 3.6: the keep mask is downsampled BILINEAR to the H/8 BA
+        # grid and thresholded at 0.9; on the dynamic field (dyn = 1 - keep,
+        # bilinear is linear) that is exactly dyn > 0.1.
+        m8 = F.interpolate(mt, size=(self.ht // self.down_scale, self.wd // self.down_scale), mode='bilinear', align_corners=False)[0, 0]
+        self.dyn_masks8[index] = (m8 > 0.1).float()
 
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
